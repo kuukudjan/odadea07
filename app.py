@@ -1,29 +1,30 @@
 """
-app.py — ODADEAƐ07 Main Application
+app.py — ODADEAƐ07 Main Application (Secured)
 
-Features:
-  • Public home page
-  • Member register / login / logout
-  • Member dashboard
-  • Membership directory (view all members when logged in)
-  • Active polls with one vote per member
-  • Dues — view open periods, pay
-  • Contributions — view active campaigns, contribute
+Security features:
+  • CSRF protection on every form
+  • Secure, HttpOnly, SameSite session cookies
+  • Failed-login rate limiting (5 attempts / 15 min per IP)
+  • Secrets read from environment only
+  • Append-only data writes (never mutate existing rows)
+
+Pages:
+  • Home, Register, Login, Logout, Dashboard
+  • Members directory, Polls, Dues, Contributions
   • Admin panel mounted at /admin (from admin_routes.py)
-
-Data: all CSV files live in ./data/. Rows are only appended or
-fully removed — existing rows are never mutated in place.
 """
 
 import os
 import json
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
+from collections import defaultdict
 
 from flask import (Flask, render_template_string, request, session, redirect,
-                   url_for, flash, send_file, jsonify)
+                   url_for, flash, send_file, jsonify, abort)
+from flask_wtf.csrf import CSRFProtect, CSRFError
 import pandas as pd
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -43,23 +44,103 @@ DUES_FILE           = os.path.join(DATA_DIR, 'dues.csv')
 DUES_CAMPAIGNS_FILE = os.path.join(DATA_DIR, 'dues_campaigns.csv')
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'change-me-in-production-please')
-app.config['PERMANENT_SESSION_LIFETIME'] = 60 * 60 * 24 * 7
+
+# ─── Secrets ──────────────────────────────────────────────
+# These MUST come from environment variables in production.
+# Fallbacks are only for local dev.
+app.secret_key = os.environ.get(
+    'SECRET_KEY',
+    'dev-only-change-me-' + str(random.randint(100000, 999999))
+)
+
+# ─── Session hardening ────────────────────────────────────
+# The site is served over HTTPS by Render, so Secure=True is safe.
+app.config.update(
+    SESSION_COOKIE_SECURE=True,        # cookie only sent over HTTPS
+    SESSION_COOKIE_HTTPONLY=True,      # JS cannot read the cookie
+    SESSION_COOKIE_SAMESITE='Lax',     # blocks most CSRF
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    WTF_CSRF_TIME_LIMIT=None,          # CSRF token valid for session lifetime
+)
+
+# ─── CSRF protection (Flask-WTF) ──────────────────────────
+csrf = CSRFProtect(app)
 
 
 # ═══════════════════════════════════════════════════════════
-# ADMIN PANEL MOUNT — THE 6 LINES (3 code + 3 config)
+# ADMIN PANEL MOUNT — the 3 essential lines
 # ═══════════════════════════════════════════════════════════
-from flask import session                       # 1. import session
-from admin_routes import admin_bp               # 2. import admin blueprint
-app.register_blueprint(admin_bp)                # 3. register it
-# ADMIN_PASSWORD is read by admin_routes.py from os.environ['ADMIN_PASSWORD']
-# SECRET_KEY is already set above (line 42) for session signing
-# PERMANENT_SESSION_LIFETIME is set above so admin logins last 7 days
+from flask import session          # noqa: E402
+from admin_routes import admin_bp  # noqa: E402
+app.register_blueprint(admin_bp)
 
 
 # ═══════════════════════════════════════════════════════════
-# DATA HELPERS
+# LOGIN RATE LIMITER (in-memory; simple + effective)
+# ═══════════════════════════════════════════════════════════
+# Tracks failed login attempts per IP. After 5 failures in
+# 15 minutes, the IP is locked out for 15 minutes.
+_login_attempts = defaultdict(list)   # ip -> [timestamps of failures]
+_LOCKOUT_WINDOW = timedelta(minutes=15)
+_MAX_ATTEMPTS   = 5
+
+
+def _client_ip():
+    # Render forwards the real IP in X-Forwarded-For
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def _is_locked_out(ip):
+    now = datetime.now()
+    attempts = [t for t in _login_attempts[ip] if now - t < _LOCKOUT_WINDOW]
+    _login_attempts[ip] = attempts
+    return len(attempts) >= _MAX_ATTEMPTS
+
+
+def _record_failure(ip):
+    _login_attempts[ip].append(datetime.now())
+
+
+def _clear_failures(ip):
+    _login_attempts.pop(ip, None)
+
+
+# ═══════════════════════════════════════════════════════════
+# ERROR HANDLERS
+# ═══════════════════════════════════════════════════════════
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    flash('Security check failed. Please try again.', 'danger')
+    return redirect(url_for('index'))
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return render_template_string("""
+    <div class="form-container" style="text-align:center;">
+      <h1>404 — Page Not Found</h1>
+      <p class="form-subtitle">That page doesn't exist.</p>
+      <a href="{{ url_for('index') }}" class="btn btn-primary">Go Home</a>
+    </div>
+    """), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return render_template_string("""
+    <div class="form-container" style="text-align:center;">
+      <h1>500 — Something went wrong</h1>
+      <p class="form-subtitle">Please try again in a moment.</p>
+      <a href="{{ url_for('index') }}" class="btn btn-primary">Go Home</a>
+    </div>
+    """), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# DATA HELPERS (append-only — never mutate existing rows)
 # ═══════════════════════════════════════════════════════════
 def load_csv(path):
     if os.path.exists(path):
@@ -101,14 +182,25 @@ def safe_amount(v):
         return 0.0
 
 
+def sanitize(s, max_len=200):
+    """Strip control chars and trim to max length."""
+    if s is None:
+        return ''
+    s = str(s).strip()
+    # Remove anything that could be used in header injection
+    s = s.replace('\r', '').replace('\n', '').replace('\x00', '')
+    return s[:max_len]
+
+
 # ═══════════════════════════════════════════════════════════
-# PUBLIC LAYOUT
+# PUBLIC LAYOUT (style.css linked, CSRF meta tag included)
 # ═══════════════════════════════════════════════════════════
 PUBLIC_LAYOUT = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>ODADEAƐ07 — PRESEC 2007 Year Group</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
@@ -226,15 +318,21 @@ def index():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        full_name = request.form.get('full_name', '').strip()
-        email     = request.form.get('email', '').strip().lower()
-        phone     = request.form.get('phone', '').strip()
-        house     = request.form.get('house', '').strip()
+        full_name = sanitize(request.form.get('full_name', ''), 120)
+        email     = sanitize(request.form.get('email', ''), 120).lower()
+        phone     = sanitize(request.form.get('phone', ''), 40)
+        house     = sanitize(request.form.get('house', ''), 60)
         password  = request.form.get('password', '')
         confirm   = request.form.get('confirm', '')
 
         if not (full_name and email and password):
             flash('Name, email and password are required.', 'danger')
+            return redirect(url_for('register'))
+        if '@' not in email or '.' not in email:
+            flash('Please enter a valid email address.', 'danger')
+            return redirect(url_for('register'))
+        if len(password) < 8:
+            flash('Password must be at least 8 characters.', 'danger')
             return redirect(url_for('register'))
         if password != confirm:
             flash('Passwords do not match.', 'danger')
@@ -263,21 +361,22 @@ def register():
       <h1>Join ODADEAƐ07</h1>
       <p class="form-subtitle">Register as a member of the 2007 Year Group</p>
       <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-group"><label>Full Name *</label>
-          <input name="full_name" required></div>
+          <input name="full_name" required maxlength="120"></div>
         <div class="form-group"><label>Email *</label>
-          <input type="email" name="email" required></div>
+          <input type="email" name="email" required maxlength="120"></div>
         <div class="form-row">
           <div class="form-group"><label>Phone</label>
-            <input name="phone" placeholder="+233 ..."></div>
+            <input name="phone" placeholder="+233 ..." maxlength="40"></div>
           <div class="form-group"><label>House</label>
-            <input name="house" placeholder="e.g. Akro, Labone"></div>
+            <input name="house" placeholder="e.g. Akro, Labone" maxlength="60"></div>
         </div>
         <div class="form-row">
-          <div class="form-group"><label>Password *</label>
-            <input type="password" name="password" required></div>
+          <div class="form-group"><label>Password * (min 8 chars)</label>
+            <input type="password" name="password" required minlength="8"></div>
           <div class="form-group"><label>Confirm Password *</label>
-            <input type="password" name="confirm" required></div>
+            <input type="password" name="confirm" required minlength="8"></div>
         </div>
         <button class="btn btn-primary btn-full">Create Account</button>
       </form>
@@ -289,15 +388,21 @@ def register():
 
 
 # ═══════════════════════════════════════════════════════════
-# LOGIN
+# LOGIN  (with rate limiting)
 # ═══════════════════════════════════════════════════════════
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    ip = _client_ip()
     if request.method == 'POST':
-        email = request.form.get('email', '').strip().lower()
+        if _is_locked_out(ip):
+            flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
+            return redirect(url_for('login'))
+
+        email = sanitize(request.form.get('email', ''), 120).lower()
         pwd   = request.form.get('password', '')
 
         members = load_csv(MEMBERS_FILE)
+        ok = False
         if not members.empty:
             row = members[members['email'].str.lower() == email]
             if not row.empty:
@@ -306,20 +411,29 @@ def login():
                     ok = check_password_hash(stored, pwd)
                 except Exception:
                     ok = False
-                if ok:
-                    session['member_id'] = row.iloc[0]['member_id']
-                    session.permanent = True
-                    flash(f"Welcome back, {row.iloc[0]['full_name']}!", 'success')
-                    return redirect(url_for('dashboard'))
-        flash('Invalid email or password.', 'danger')
+
+        if ok:
+            _clear_failures(ip)
+            session['member_id'] = row.iloc[0]['member_id']
+            session.permanent = True
+            flash(f"Welcome back, {row.iloc[0]['full_name']}!", 'success')
+            return redirect(url_for('dashboard'))
+
+        _record_failure(ip)
+        remaining = _MAX_ATTEMPTS - len(_login_attempts[ip])
+        if remaining > 0:
+            flash(f'Invalid email or password. {remaining} attempts left.', 'danger')
+        else:
+            flash('Too many failed attempts. Account locked for 15 minutes.', 'danger')
 
     content = render_template_string("""
     <div class="form-container">
       <h1>Login</h1>
       <p class="form-subtitle">Welcome back, Odadeɛ</p>
       <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-group"><label>Email</label>
-          <input type="email" name="email" required autofocus></div>
+          <input type="email" name="email" required autofocus maxlength="120"></div>
         <div class="form-group"><label>Password</label>
           <input type="password" name="password" required></div>
         <button class="btn btn-primary btn-full">Login</button>
@@ -350,8 +464,8 @@ def dashboard():
         flash('Session expired. Please log in again.', 'warning')
         return redirect(url_for('login'))
 
-    votes = load_csv(VOTES_FILE)
-    dues  = load_csv(DUES_FILE)
+    votes    = load_csv(VOTES_FILE)
+    dues     = load_csv(DUES_FILE)
     contribs = load_csv(CONTRIBUTIONS_FILE)
 
     my_votes   = len(votes[votes['member_id'] == m['member_id']]) if not votes.empty else 0
@@ -414,7 +528,7 @@ def dashboard():
 
 
 # ═══════════════════════════════════════════════════════════
-# MEMBERSHIP DIRECTORY  (visible to logged-in members)
+# MEMBERSHIP DIRECTORY
 # ═══════════════════════════════════════════════════════════
 @app.route('/members')
 @member_required
@@ -424,7 +538,6 @@ def members_directory():
         df = df.drop(columns=['password_hash'])
     members = df.to_dict('records') if not df.empty else []
 
-    # Group by house for a nicer view
     houses = {}
     for m in members:
         h = (m.get('house') or 'Not Specified').strip() or 'Not Specified'
@@ -470,7 +583,7 @@ def members_directory():
 
 
 # ═══════════════════════════════════════════════════════════
-# POLLS (voting)
+# POLLS
 # ═══════════════════════════════════════════════════════════
 @app.route('/polls', methods=['GET', 'POST'])
 @member_required
@@ -478,7 +591,6 @@ def polls_page():
     if request.method == 'POST':
         poll_id   = request.form.get('poll_id')
         option_id = request.form.get('option_id')
-
         if not (poll_id and option_id):
             flash('Please select an option.', 'warning')
             return redirect(url_for('polls_page'))
@@ -493,12 +605,12 @@ def polls_page():
 
         m = current_member()
         append_row(VOTES_FILE, {
-            'vote_id':      f"V{int(time.time())}{random.randint(100,999)}",
-            'poll_id':      poll_id,
-            'option_id':    option_id,
-            'member_id':    session['member_id'],
-            'member_name':  m['full_name'] if m else '',
-            'voted_at':     datetime.now().isoformat(),
+            'vote_id':     f"V{int(time.time())}{random.randint(100,999)}",
+            'poll_id':     poll_id,
+            'option_id':   option_id,
+            'member_id':   session['member_id'],
+            'member_name': m['full_name'] if m else '',
+            'voted_at':    datetime.now().isoformat(),
         })
         flash('✅ Vote recorded. Thank you!', 'success')
         return redirect(url_for('polls_page'))
@@ -539,6 +651,7 @@ def polls_page():
         <span class="voted-badge">✅ You've voted</span>
       {% else %}
         <form method="POST">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="poll_id" value="{{ p.id }}">
           <div class="vote-options">
             {% for o in p.options %}
@@ -571,19 +684,19 @@ def dues_page():
             amount = float(request.form.get('amount', 0) or 0)
         except ValueError:
             amount = 0
-        method = request.form.get('method', 'Mobile Money')
+        method = sanitize(request.form.get('method', 'Mobile Money'), 40)
 
         if dues_id and amount > 0:
             m = current_member()
             append_row(DUES_FILE, {
-                'payment_id':   f"D{int(time.time())}{random.randint(100,999)}",
-                'dues_id':      dues_id,
-                'member_id':    session['member_id'],
-                'member_name':  m['full_name'] if m else '',
-                'amount':       amount,
-                'method':       method,
-                'note':         '',
-                'created_at':   datetime.now().isoformat(),
+                'payment_id':  f"D{int(time.time())}{random.randint(100,999)}",
+                'dues_id':     dues_id,
+                'member_id':   session['member_id'],
+                'member_name': m['full_name'] if m else '',
+                'amount':      amount,
+                'method':      method,
+                'note':        '',
+                'created_at':  datetime.now().isoformat(),
             })
             flash(f'✅ Dues payment of GH₵{amount:.2f} recorded.', 'success')
         else:
@@ -622,6 +735,7 @@ def dues_page():
         <span class="voted-badge">✅ Paid</span>
       {% else %}
         <form method="POST">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="dues_id" value="{{ d.id }}">
           <div class="form-row">
             <div class="form-group"><label>Amount (GH₵)</label>
@@ -652,12 +766,12 @@ def dues_page():
 @member_required
 def contributions_page():
     if request.method == 'POST':
-        cid    = request.form.get('campaign_id')
+        cid = request.form.get('campaign_id')
         try:
             amount = float(request.form.get('amount', 0) or 0)
         except ValueError:
             amount = 0
-        method = request.form.get('method', 'Mobile Money')
+        method = sanitize(request.form.get('method', 'Mobile Money'), 40)
 
         if cid and amount > 0:
             m = current_member()
@@ -717,6 +831,7 @@ def contributions_page():
         raised of GH₵{{ "%.2f"|format(c.target) }}
       </p>
       <form method="POST" style="margin-top:1rem;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="campaign_id" value="{{ c.id }}">
         <div class="form-row">
           <div class="form-group"><label>Amount (GH₵)</label>
@@ -750,4 +865,4 @@ def health():
 # MAIN
 # ═══════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=5000)

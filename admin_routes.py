@@ -1,20 +1,14 @@
 """
-admin_routes.py — ODADEAƐ07 Admin Panel
-────────────────────────────────────────
+admin_routes.py — ODADEAƐ07 Admin Panel (Secured)
+
 Mounted at /admin by app.py.
 
-Features:
-  • Login (password only)
-  • Dashboard with live stats
-  • Polls    — create, close, delete, view results
-  • Contrib  — create, close, delete, view progress
-  • Dues     — create, close, delete, view collection
-  • Members  — add, edit, delete, view
-  • Reports  — voting / dues / contributions / members
-  • Downloads — every CSV as a file
-
-Data integrity: rows are only appended or fully removed.
-No in-place mutation of existing rows.
+Security:
+  • CSRF tokens on every POST form
+  • Admin-login rate limiting (5 attempts / 15 min)
+  • Session cookies: Secure, HttpOnly, SameSite=Lax
+  • All inputs sanitized and length-capped
+  • Append-only data writes; deletions are explicit
 """
 
 import os
@@ -23,12 +17,14 @@ import csv
 import json
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
+from collections import defaultdict
 
 import pandas as pd
 from flask import (Blueprint, render_template_string, request, session,
                    redirect, url_for, flash, send_file, make_response)
+from flask_wtf.csrf import generate_csrf
 
 # ─────────────────────────────────────────────────────────
 # PATHS
@@ -45,13 +41,42 @@ DUES_CAMPAIGNS_FILE = os.path.join(DATA_DIR, 'dues_campaigns.csv')
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'odadea07admin')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'CHANGE-ME-NOW')
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
 
 # ─────────────────────────────────────────────────────────
-# DATA HELPERS  (append-only — never mutates existing rows)
+# RATE LIMITER (admin login)
+# ─────────────────────────────────────────────────────────
+_admin_attempts = defaultdict(list)
+_WINDOW  = timedelta(minutes=15)
+_MAX     = 5
+
+
+def _client_ip():
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def _locked(ip):
+    now = datetime.now()
+    _admin_attempts[ip] = [t for t in _admin_attempts[ip] if now - t < _WINDOW]
+    return len(_admin_attempts[ip]) >= _MAX
+
+
+def _fail(ip):
+    _admin_attempts[ip].append(datetime.now())
+
+
+def _clear(ip):
+    _admin_attempts.pop(ip, None)
+
+
+# ─────────────────────────────────────────────────────────
+# DATA HELPERS (append-only)
 # ─────────────────────────────────────────────────────────
 def _load(path):
     if os.path.exists(path):
@@ -95,6 +120,13 @@ def _update_where(path, id_col, id_val, updates):
     return True
 
 
+def _sanitize(s, max_len=200):
+    if s is None:
+        return ''
+    s = str(s).strip().replace('\r', '').replace('\n', '').replace('\x00', '')
+    return s[:max_len]
+
+
 def _csv_bytes(rows):
     buf = io.StringIO()
     if rows:
@@ -116,13 +148,14 @@ def _admin_required(f):
 
 
 # ─────────────────────────────────────────────────────────
-# LAYOUT  (uses your existing style.css — no templates folder)
+# LAYOUT
 # ─────────────────────────────────────────────────────────
 ADMIN_LAYOUT = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Admin — ODADEAƐ07</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
@@ -175,7 +208,7 @@ ADMIN_LAYOUT = r"""<!DOCTYPE html>
 
 
 def _page(body):
-    return render_template_string(ADMIN_LAYOUT, body=body)
+    return render_template_string(ADMIN_LAYOUT, body=body, csrf_token=generate_csrf)
 
 
 # ─────────────────────────────────────────────────────────
@@ -183,18 +216,33 @@ def _page(body):
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/login', methods=['GET', 'POST'])
 def login():
+    ip = _client_ip()
+
     if request.method == 'POST':
+        if _locked(ip):
+            flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
+            return redirect(url_for('admin.login'))
+
         if request.form.get('password') == ADMIN_PASSWORD:
+            _clear(ip)
             session['is_admin'] = True
             session.permanent = True
             flash('Welcome, admin.', 'success')
             return redirect(url_for('admin.home'))
-        flash('Wrong password.', 'danger')
+
+        _fail(ip)
+        remaining = _MAX - len(_admin_attempts[ip])
+        if remaining > 0:
+            flash(f'Wrong password. {remaining} attempts left.', 'danger')
+        else:
+            flash('Too many failed attempts. Locked for 15 minutes.', 'danger')
+
     body = render_template_string("""
     <div class="form-container">
       <h1>🛡️ Admin Login</h1>
       <p class="form-subtitle">Private access — ODADEAƐ07</p>
       <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-group">
           <label>Admin Password</label>
           <input type="password" name="password" required autofocus>
@@ -294,13 +342,13 @@ def polls():
         action = request.form.get('action', 'create')
 
         if action == 'create':
-            title = request.form.get('title', '').strip()
-            desc  = request.form.get('description', '').strip()
+            title = _sanitize(request.form.get('title', ''), 200)
+            desc  = _sanitize(request.form.get('description', ''), 400)
             try:
                 n = int(request.form.get('option_count', 2))
             except ValueError:
                 n = 2
-            opts = [request.form.get(f'option_{i}', '').strip() for i in range(n)]
+            opts = [_sanitize(request.form.get(f'option_{i}', ''), 120) for i in range(n)]
             opts = [o for o in opts if o]
             if title and len(opts) >= 2:
                 _append(POLLS_FILE, {
@@ -383,19 +431,20 @@ def polls():
     <div class="form-container">
       <h1>➕ Create a Poll</h1>
       <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="create">
         <div class="form-group"><label>Title *</label>
-          <input name="title" required></div>
+          <input name="title" required maxlength="200"></div>
         <div class="form-group"><label>Description (optional)</label>
-          <textarea name="description"></textarea></div>
+          <textarea name="description" maxlength="400"></textarea></div>
         <div class="form-group"><label>Option 1 *</label>
-          <input name="option_0" required></div>
+          <input name="option_0" required maxlength="120"></div>
         <div class="form-group"><label>Option 2 *</label>
-          <input name="option_1" required></div>
+          <input name="option_1" required maxlength="120"></div>
         <div class="form-group"><label>Option 3 (optional)</label>
-          <input name="option_2"></div>
+          <input name="option_2" maxlength="120"></div>
         <div class="form-group"><label>Option 4 (optional)</label>
-          <input name="option_3"></div>
+          <input name="option_3" maxlength="120"></div>
         <input type="hidden" name="option_count" value="4">
         <button class="btn btn-primary btn-full">Create Poll</button>
       </form>
@@ -447,6 +496,7 @@ def polls():
 
       <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:1rem; padding-top:1rem; border-top:1px dashed var(--gray-200);">
         <form method="POST" style="display:inline;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="toggle">
           <input type="hidden" name="poll_id" value="{{ p.id }}">
           <button class="btn btn-small btn-secondary">
@@ -455,6 +505,7 @@ def polls():
         </form>
         <form method="POST" style="display:inline;"
               onsubmit="return confirm('Delete this poll and all votes?');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="poll_id" value="{{ p.id }}">
           <button class="btn btn-small btn-primary">🗑️ Delete</button>
@@ -478,8 +529,8 @@ def contrib():
         action = request.form.get('action', 'create')
 
         if action == 'create':
-            title = request.form.get('title', '').strip()
-            desc  = request.form.get('description', '').strip()
+            title = _sanitize(request.form.get('title', ''), 200)
+            desc  = _sanitize(request.form.get('description', ''), 400)
             try:
                 target = float(request.form.get('target_amount', 0) or 0)
             except ValueError:
@@ -555,11 +606,12 @@ def contrib():
     <div class="form-container">
       <h1>➕ Create Campaign</h1>
       <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="create">
         <div class="form-group"><label>Title *</label>
-          <input name="title" required></div>
+          <input name="title" required maxlength="200"></div>
         <div class="form-group"><label>Description (optional)</label>
-          <textarea name="description"></textarea></div>
+          <textarea name="description" maxlength="400"></textarea></div>
         <div class="form-group"><label>Target amount (GH₵) *</label>
           <input type="number" step="0.01" name="target_amount" required></div>
         <button class="btn btn-primary btn-full">Create Campaign</button>
@@ -611,6 +663,7 @@ def contrib():
 
       <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:1rem;padding-top:1rem;border-top:1px dashed var(--gray-200);">
         <form method="POST" style="display:inline;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="toggle">
           <input type="hidden" name="campaign_id" value="{{ c.id }}">
           <button class="btn btn-small btn-secondary">
@@ -619,6 +672,7 @@ def contrib():
         </form>
         <form method="POST" style="display:inline;"
               onsubmit="return confirm('Delete this campaign and all payments?');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="campaign_id" value="{{ c.id }}">
           <button class="btn btn-small btn-primary">🗑️ Delete</button>
@@ -642,8 +696,8 @@ def dues():
         action = request.form.get('action', 'create')
 
         if action == 'create':
-            month = request.form.get('month', '').strip()
-            year  = request.form.get('year', '').strip()
+            month = _sanitize(request.form.get('month', ''), 30)
+            year  = _sanitize(request.form.get('year', ''), 10)
             try:
                 amount = float(request.form.get('amount', 0) or 0)
             except ValueError:
@@ -715,12 +769,13 @@ def dues():
     <div class="form-container">
       <h1>➕ Create Dues Period</h1>
       <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="create">
         <div class="form-row">
           <div class="form-group"><label>Month *</label>
-            <input name="month" required placeholder="October"></div>
+            <input name="month" required placeholder="October" maxlength="30"></div>
           <div class="form-group"><label>Year *</label>
-            <input name="year" required placeholder="2026"></div>
+            <input name="year" required placeholder="2026" maxlength="10"></div>
         </div>
         <div class="form-group"><label>Amount per member (GH₵) *</label>
           <input type="number" step="0.01" name="amount" required></div>
@@ -773,6 +828,7 @@ def dues():
 
       <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:1rem;padding-top:1rem;border-top:1px dashed var(--gray-200);">
         <form method="POST" style="display:inline;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="toggle">
           <input type="hidden" name="dues_id" value="{{ d.id }}">
           <button class="btn btn-small btn-secondary">
@@ -781,6 +837,7 @@ def dues():
         </form>
         <form method="POST" style="display:inline;"
               onsubmit="return confirm('Delete this dues period and all payments?');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="dues_id" value="{{ d.id }}">
           <button class="btn btn-small btn-primary">🗑️ Delete</button>
@@ -804,10 +861,10 @@ def members():
         action = request.form.get('action', 'add')
 
         if action == 'add':
-            full_name = request.form.get('full_name', '').strip()
-            email     = request.form.get('email', '').strip().lower()
-            phone     = request.form.get('phone', '').strip()
-            house     = request.form.get('house', '').strip()
+            full_name = _sanitize(request.form.get('full_name', ''), 120)
+            email     = _sanitize(request.form.get('email', ''), 120).lower()
+            phone     = _sanitize(request.form.get('phone', ''), 40)
+            house     = _sanitize(request.form.get('house', ''), 60)
             if full_name and email:
                 from werkzeug.security import generate_password_hash
                 _append(MEMBERS_FILE, {
@@ -824,10 +881,10 @@ def members():
         elif action == 'edit':
             mid = request.form.get('member_id')
             updates = {
-                'full_name': request.form.get('full_name', '').strip(),
-                'email': request.form.get('email', '').strip().lower(),
-                'phone': request.form.get('phone', '').strip(),
-                'house': request.form.get('house', '').strip(),
+                'full_name': _sanitize(request.form.get('full_name', ''), 120),
+                'email':     _sanitize(request.form.get('email', ''), 120).lower(),
+                'phone':     _sanitize(request.form.get('phone', ''), 40),
+                'house':     _sanitize(request.form.get('house', ''), 60),
             }
             if mid and _update_where(MEMBERS_FILE, 'member_id', mid, updates):
                 flash('Member updated.', 'success')
@@ -861,18 +918,19 @@ def members():
       <h1>➕ Add Member</h1>
       <p class="form-subtitle">Default password: changeme123 — ask them to reset after login</p>
       <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="add">
         <div class="form-row">
           <div class="form-group"><label>Full Name *</label>
-            <input name="full_name" required></div>
+            <input name="full_name" required maxlength="120"></div>
           <div class="form-group"><label>Email *</label>
-            <input type="email" name="email" required></div>
+            <input type="email" name="email" required maxlength="120"></div>
         </div>
         <div class="form-row">
           <div class="form-group"><label>Phone</label>
-            <input name="phone"></div>
+            <input name="phone" maxlength="40"></div>
           <div class="form-group"><label>House</label>
-            <input name="house"></div>
+            <input name="house" maxlength="60"></div>
         </div>
         <button class="btn btn-primary btn-full">Add Member</button>
       </form>
@@ -894,20 +952,22 @@ def members():
               <details>
                 <summary style="cursor:pointer;color:var(--presec-blue);font-weight:700;">Edit</summary>
                 <form method="POST" style="margin-top:0.5rem;">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                   <input type="hidden" name="action" value="edit">
                   <input type="hidden" name="member_id" value="{{ m.member_id }}">
                   <div class="form-group"><label>Name</label>
-                    <input name="full_name" value="{{ m.full_name }}"></div>
+                    <input name="full_name" value="{{ m.full_name }}" maxlength="120"></div>
                   <div class="form-group"><label>Email</label>
-                    <input name="email" value="{{ m.email }}"></div>
+                    <input name="email" value="{{ m.email }}" maxlength="120"></div>
                   <div class="form-group"><label>Phone</label>
-                    <input name="phone" value="{{ m.phone }}"></div>
+                    <input name="phone" value="{{ m.phone }}" maxlength="40"></div>
                   <div class="form-group"><label>House</label>
-                    <input name="house" value="{{ m.house }}"></div>
+                    <input name="house" value="{{ m.house }}" maxlength="60"></div>
                   <button class="btn btn-small btn-primary">Save</button>
                 </form>
                 <form method="POST" style="margin-top:0.5rem;"
                       onsubmit="return confirm('Delete this member?');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                   <input type="hidden" name="action" value="delete">
                   <input type="hidden" name="member_id" value="{{ m.member_id }}">
                   <button class="btn btn-small btn-primary">🗑️ Delete</button>
