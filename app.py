@@ -1,16 +1,16 @@
 """
-app.py — ODADEAƐ07 Main Application (Secured, Supabase-aware)
+app.py — ODADEAƐ07 Main Application (Secured, Supabase-aware, Password Reset)
 
-Data source logic:
-  • If SUPABASE_URL + SUPABASE_KEY are set → data lives in Supabase
-  • Otherwise → falls back to local CSV files in ./data/
+Adds:
+  • /forgot-password  — request reset link by email
+  • /reset-password   — set new password via token
 
 Security:
-  • CSRF tokens on every form
-  • Secure / HttpOnly / SameSite session cookies
-  • Failed-login rate limiting (5 tries / 15 min per IP)
-  • Input sanitization and length caps
-  • Append-only CSV writes
+  • CSRF on all forms
+  • Secure / HttpOnly / SameSite cookies
+  • Login rate limiting
+  • Password reset tokens: 1-hour expiry, one-time use, cryptographically random
+  • Rate limiting on reset requests (prevents email spam)
 """
 
 import os
@@ -28,6 +28,8 @@ import pandas as pd
 from werkzeug.security import generate_password_hash, check_password_hash
 
 import supabase_client as sb
+import password_reset as pr
+import mailer
 
 # ═══════════════════════════════════════════════════════════
 # CONFIG
@@ -70,11 +72,14 @@ app.register_blueprint(admin_bp)
 
 
 # ═══════════════════════════════════════════════════════════
-# RATE LIMITER
+# RATE LIMITERS
 # ═══════════════════════════════════════════════════════════
 _login_attempts = defaultdict(list)
+_reset_attempts = defaultdict(list)
 _WINDOW = timedelta(minutes=15)
 _MAX    = 5
+_RESET_WINDOW = timedelta(hours=1)
+_RESET_MAX    = 3
 
 
 def _client_ip():
@@ -84,18 +89,18 @@ def _client_ip():
     return request.remote_addr or 'unknown'
 
 
-def _locked(ip):
+def _locked(store, ip, window, max_attempts):
     now = datetime.now()
-    _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < _WINDOW]
-    return len(_login_attempts[ip]) >= _MAX
+    store[ip] = [t for t in store[ip] if now - t < window]
+    return len(store[ip]) >= max_attempts
 
 
-def _record_failure(ip):
-    _login_attempts[ip].append(datetime.now())
+def _record(store, ip):
+    store[ip].append(datetime.now())
 
 
-def _clear_failures(ip):
-    _login_attempts.pop(ip, None)
+def _clear(store, ip):
+    store.pop(ip, None)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -107,38 +112,16 @@ def handle_csrf_error(e):
     return redirect(url_for('index'))
 
 
-@app.errorhandler(404)
-def not_found(e):
-    return render_template_string("""
-    <div class="form-container" style="text-align:center;">
-      <h1>404 — Page Not Found</h1>
-      <a href="{{ url_for('index') }}" class="btn btn-primary">Go Home</a>
-    </div>
-    """), 404
-
-
-@app.errorhandler(500)
-def server_error(e):
-    return render_template_string("""
-    <div class="form-container" style="text-align:center;">
-      <h1>500 — Something went wrong</h1>
-      <a href="{{ url_for('index') }}" class="btn btn-primary">Go Home</a>
-    </div>
-    """), 500
-
-
 # ═══════════════════════════════════════════════════════════
-# DATA HELPERS (Supabase-aware with CSV fallback)
+# DATA HELPERS
 # ═══════════════════════════════════════════════════════════
 def load_csv(path):
-    """Legacy CSV loader (used only if Supabase is off)."""
     if os.path.exists(path):
         return pd.read_csv(path, dtype=str).fillna('')
     return pd.DataFrame()
 
 
 def append_row(path, row):
-    """Legacy CSV appender (used only if Supabase is off)."""
     df = load_csv(path)
     new = pd.DataFrame([row])
     out = pd.concat([df, new], ignore_index=True) if not df.empty else new
@@ -146,12 +129,6 @@ def append_row(path, row):
 
 
 def load_table(table_name, csv_path):
-    """
-    Unified loader:
-      • If Supabase is on → fetch from Supabase
-      • Else → read CSV
-    Always returns a pandas DataFrame with dtype=str.
-    """
     if sb.SUPABASE_ENABLED:
         rows = sb.fetch_all(table_name)
         if rows:
@@ -161,11 +138,6 @@ def load_table(table_name, csv_path):
 
 
 def insert_row(table_name, csv_path, row):
-    """
-    Unified inserter:
-      • If Supabase is on → insert into Supabase
-      • Else → append to CSV
-    """
     if sb.SUPABASE_ENABLED:
         client = sb.get_client()
         if client is not None:
@@ -174,12 +146,10 @@ def insert_row(table_name, csv_path, row):
                 return True
             except Exception as e:
                 print(f'[Supabase insert failed for {table_name}]: {e}')
-    # Fallback
     append_row(csv_path, row)
     return True
 
 
-# Table-name constants for Supabase
 T_MEMBERS        = 'members'
 T_POLLS          = 'polls'
 T_VOTES          = 'votes'
@@ -279,9 +249,7 @@ PUBLIC_LAYOUT = r"""<!DOCTYPE html>
     {% endif %}
 {% endwith %}
 
-<main class="main-content">
-    {{ content|safe }}
-</main>
+<main class="main-content">{{ content|safe }}</main>
 
 <footer class="main-footer">
     <div class="footer-content">
@@ -426,7 +394,7 @@ def register():
 def login():
     ip = _client_ip()
     if request.method == 'POST':
-        if _locked(ip):
+        if _locked(_login_attempts, ip, _WINDOW, _MAX):
             flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
             return redirect(url_for('login'))
 
@@ -447,13 +415,13 @@ def login():
                     ok = False
 
         if ok and row is not None:
-            _clear_failures(ip)
+            _clear(_login_attempts, ip)
             session['member_id'] = row.iloc[0]['member_id']
             session.permanent = True
             flash(f"Welcome back, {row.iloc[0]['full_name']}!", 'success')
             return redirect(url_for('dashboard'))
 
-        _record_failure(ip)
+        _record(_login_attempts, ip)
         remaining = _MAX - len(_login_attempts[ip])
         if remaining > 0:
             flash(f'Invalid email or password. {remaining} attempts left.', 'danger')
@@ -472,8 +440,10 @@ def login():
           <input type="password" name="password" required></div>
         <button class="btn btn-primary btn-full">Login</button>
       </form>
-      <p class="form-footer">New here?
-        <a href="{{ url_for('register') }}">Register</a></p>
+      <p class="form-footer">
+        <a href="{{ url_for('forgot_password') }}">Forgot password?</a> •
+        New here? <a href="{{ url_for('register') }}">Register</a>
+      </p>
     </div>
     """)
     return page(content)
@@ -487,7 +457,129 @@ def logout():
 
 
 # ═══════════════════════════════════════════════════════════
-# MEMBER DASHBOARD
+# FORGOT PASSWORD — request reset link
+# ═══════════════════════════════════════════════════════════
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    ip = _client_ip()
+    if request.method == 'POST':
+        if _locked(_reset_attempts, ip, _RESET_WINDOW, _RESET_MAX):
+            flash('Too many reset requests. Please try again later.', 'danger')
+            return redirect(url_for('forgot_password'))
+
+        email = sanitize(request.form.get('email', ''), 120).lower()
+
+        # Always show the same message, whether or not the email exists
+        # (prevents attackers from enumerating registered emails)
+        success_msg = ('If that email is registered, a reset link has been sent. '
+                       'Check your inbox and spam folder.')
+
+        if not email or '@' not in email:
+            flash('Please enter a valid email address.', 'danger')
+            return redirect(url_for('forgot_password'))
+
+        members = load_table(T_MEMBERS, MEMBERS_FILE)
+        member = None
+        if not members.empty:
+            sub = members[members['email'].str.lower() == email]
+            if not sub.empty:
+                member = sub.iloc[0].to_dict()
+
+        if member:
+            token = pr.create_reset_token(member['member_id'], email)
+            base = request.url_root.rstrip('/')
+            reset_url = f'{base}/reset-password?token={token}'
+            ok, err = mailer.send_password_reset(
+                email, member.get('full_name', 'Odadeɛ'), reset_url
+            )
+            if not ok:
+                # Log the link so admin can still help if email fails
+                print(f'[forgot-password] Email failed for {email}: {err}')
+                print(f'[forgot-password] Manual link: {reset_url}')
+
+        _record(_reset_attempts, ip)
+        flash(success_msg, 'info')
+        return redirect(url_for('login'))
+
+    content = render_template_string("""
+    <div class="form-container">
+      <h1>Forgot your password?</h1>
+      <p class="form-subtitle">Enter your email and we'll send a reset link</p>
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group"><label>Email</label>
+          <input type="email" name="email" required autofocus maxlength="120"></div>
+        <button class="btn btn-primary btn-full">Send reset link</button>
+      </form>
+      <p class="form-footer">
+        Remembered it? <a href="{{ url_for('login') }}">Back to login</a>
+      </p>
+    </div>
+    """)
+    return page(content)
+
+
+# ═══════════════════════════════════════════════════════════
+# RESET PASSWORD — set new password via token
+# ═══════════════════════════════════════════════════════════
+@app.route('/reset-password', methods=['GET', 'POST'])
+def reset_password():
+    token = request.args.get('token', '') or request.form.get('token', '')
+
+    # Verify token before showing the form
+    row = pr.verify_token(token)
+    if not row:
+        content = render_template_string("""
+        <div class="form-container" style="text-align:center;">
+          <h1>Invalid or expired link</h1>
+          <p class="form-subtitle">
+            This reset link has expired or was already used.
+          </p>
+          <a href="{{ url_for('forgot_password') }}" class="btn btn-primary">
+            Request a new link
+          </a>
+        </div>
+        """)
+        return page(content)
+
+    if request.method == 'POST':
+        new_password = request.form.get('password', '')
+        confirm      = request.form.get('confirm', '')
+
+        if len(new_password) < 8:
+            flash('Password must be at least 8 characters.', 'danger')
+            return redirect(url_for('reset_password', token=token))
+        if new_password != confirm:
+            flash('Passwords do not match.', 'danger')
+            return redirect(url_for('reset_password', token=token))
+
+        ok, msg = pr.consume_token(token, new_password)
+        if ok:
+            flash(msg, 'success')
+            return redirect(url_for('login'))
+        flash(msg, 'danger')
+        return redirect(url_for('forgot_password'))
+
+    content = render_template_string("""
+    <div class="form-container">
+      <h1>Choose a new password</h1>
+      <p class="form-subtitle">Your data stays exactly the same</p>
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="token" value="{{ token }}">
+        <div class="form-group"><label>New password (min 8 chars)</label>
+          <input type="password" name="password" required minlength="8" autofocus></div>
+        <div class="form-group"><label>Confirm new password</label>
+          <input type="password" name="confirm" required minlength="8"></div>
+        <button class="btn btn-primary btn-full">Update password</button>
+      </form>
+    </div>
+    """, token=token)
+    return page(content)
+
+
+# ═══════════════════════════════════════════════════════════
+# DASHBOARD
 # ═══════════════════════════════════════════════════════════
 @app.route('/dashboard')
 @member_required
@@ -896,6 +988,7 @@ def health():
     return jsonify({
         'status': 'ok',
         'supabase_enabled': sb.SUPABASE_ENABLED,
+        'email_enabled': mailer.EMAIL_ENABLED,
         'time': datetime.now().isoformat()
     })
 
