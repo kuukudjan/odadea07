@@ -1,17 +1,16 @@
 """
-app.py — ODADEAƐ07 Main Application (Secured)
+app.py — ODADEAƐ07 Main Application (Secured, Supabase-aware)
 
-Security features:
-  • CSRF protection on every form
-  • Secure, HttpOnly, SameSite session cookies
-  • Failed-login rate limiting (5 attempts / 15 min per IP)
-  • Secrets read from environment only
-  • Append-only data writes (never mutate existing rows)
+Data source logic:
+  • If SUPABASE_URL + SUPABASE_KEY are set → data lives in Supabase
+  • Otherwise → falls back to local CSV files in ./data/
 
-Pages:
-  • Home, Register, Login, Logout, Dashboard
-  • Members directory, Polls, Dues, Contributions
-  • Admin panel mounted at /admin (from admin_routes.py)
+Security:
+  • CSRF tokens on every form
+  • Secure / HttpOnly / SameSite session cookies
+  • Failed-login rate limiting (5 tries / 15 min per IP)
+  • Input sanitization and length caps
+  • Append-only CSV writes
 """
 
 import os
@@ -23,10 +22,12 @@ from functools import wraps
 from collections import defaultdict
 
 from flask import (Flask, render_template_string, request, session, redirect,
-                   url_for, flash, send_file, jsonify, abort)
+                   url_for, flash, send_file, jsonify)
 from flask_wtf.csrf import CSRFProtect, CSRFError
 import pandas as pd
 from werkzeug.security import generate_password_hash, check_password_hash
+
+import supabase_client as sb
 
 # ═══════════════════════════════════════════════════════════
 # CONFIG
@@ -45,59 +46,48 @@ DUES_CAMPAIGNS_FILE = os.path.join(DATA_DIR, 'dues_campaigns.csv')
 
 app = Flask(__name__)
 
-# ─── Secrets ──────────────────────────────────────────────
-# These MUST come from environment variables in production.
-# Fallbacks are only for local dev.
 app.secret_key = os.environ.get(
     'SECRET_KEY',
     'dev-only-change-me-' + str(random.randint(100000, 999999))
 )
 
-# ─── Session hardening ────────────────────────────────────
-# The site is served over HTTPS by Render, so Secure=True is safe.
 app.config.update(
-    SESSION_COOKIE_SECURE=True,        # cookie only sent over HTTPS
-    SESSION_COOKIE_HTTPONLY=True,      # JS cannot read the cookie
-    SESSION_COOKIE_SAMESITE='Lax',     # blocks most CSRF
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
-    WTF_CSRF_TIME_LIMIT=None,          # CSRF token valid for session lifetime
+    WTF_CSRF_TIME_LIMIT=None,
 )
 
-# ─── CSRF protection (Flask-WTF) ──────────────────────────
 csrf = CSRFProtect(app)
 
 
 # ═══════════════════════════════════════════════════════════
-# ADMIN PANEL MOUNT — the 3 essential lines
+# ADMIN PANEL MOUNT
 # ═══════════════════════════════════════════════════════════
-from flask import session          # noqa: E402
 from admin_routes import admin_bp  # noqa: E402
 app.register_blueprint(admin_bp)
 
 
 # ═══════════════════════════════════════════════════════════
-# LOGIN RATE LIMITER (in-memory; simple + effective)
+# RATE LIMITER
 # ═══════════════════════════════════════════════════════════
-# Tracks failed login attempts per IP. After 5 failures in
-# 15 minutes, the IP is locked out for 15 minutes.
-_login_attempts = defaultdict(list)   # ip -> [timestamps of failures]
-_LOCKOUT_WINDOW = timedelta(minutes=15)
-_MAX_ATTEMPTS   = 5
+_login_attempts = defaultdict(list)
+_WINDOW = timedelta(minutes=15)
+_MAX    = 5
 
 
 def _client_ip():
-    # Render forwards the real IP in X-Forwarded-For
     fwd = request.headers.get('X-Forwarded-For', '')
     if fwd:
         return fwd.split(',')[0].strip()
     return request.remote_addr or 'unknown'
 
 
-def _is_locked_out(ip):
+def _locked(ip):
     now = datetime.now()
-    attempts = [t for t in _login_attempts[ip] if now - t < _LOCKOUT_WINDOW]
-    _login_attempts[ip] = attempts
-    return len(attempts) >= _MAX_ATTEMPTS
+    _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < _WINDOW]
+    return len(_login_attempts[ip]) >= _MAX
 
 
 def _record_failure(ip):
@@ -122,7 +112,6 @@ def not_found(e):
     return render_template_string("""
     <div class="form-container" style="text-align:center;">
       <h1>404 — Page Not Found</h1>
-      <p class="form-subtitle">That page doesn't exist.</p>
       <a href="{{ url_for('index') }}" class="btn btn-primary">Go Home</a>
     </div>
     """), 404
@@ -133,26 +122,71 @@ def server_error(e):
     return render_template_string("""
     <div class="form-container" style="text-align:center;">
       <h1>500 — Something went wrong</h1>
-      <p class="form-subtitle">Please try again in a moment.</p>
       <a href="{{ url_for('index') }}" class="btn btn-primary">Go Home</a>
     </div>
     """), 500
 
 
 # ═══════════════════════════════════════════════════════════
-# DATA HELPERS (append-only — never mutate existing rows)
+# DATA HELPERS (Supabase-aware with CSV fallback)
 # ═══════════════════════════════════════════════════════════
 def load_csv(path):
+    """Legacy CSV loader (used only if Supabase is off)."""
     if os.path.exists(path):
         return pd.read_csv(path, dtype=str).fillna('')
     return pd.DataFrame()
 
 
 def append_row(path, row):
+    """Legacy CSV appender (used only if Supabase is off)."""
     df = load_csv(path)
     new = pd.DataFrame([row])
     out = pd.concat([df, new], ignore_index=True) if not df.empty else new
     out.to_csv(path, index=False)
+
+
+def load_table(table_name, csv_path):
+    """
+    Unified loader:
+      • If Supabase is on → fetch from Supabase
+      • Else → read CSV
+    Always returns a pandas DataFrame with dtype=str.
+    """
+    if sb.SUPABASE_ENABLED:
+        rows = sb.fetch_all(table_name)
+        if rows:
+            return pd.DataFrame(rows).fillna('').astype(str)
+        return pd.DataFrame()
+    return load_csv(csv_path)
+
+
+def insert_row(table_name, csv_path, row):
+    """
+    Unified inserter:
+      • If Supabase is on → insert into Supabase
+      • Else → append to CSV
+    """
+    if sb.SUPABASE_ENABLED:
+        client = sb.get_client()
+        if client is not None:
+            try:
+                client.table(table_name).insert(row).execute()
+                return True
+            except Exception as e:
+                print(f'[Supabase insert failed for {table_name}]: {e}')
+    # Fallback
+    append_row(csv_path, row)
+    return True
+
+
+# Table-name constants for Supabase
+T_MEMBERS        = 'members'
+T_POLLS          = 'polls'
+T_VOTES          = 'votes'
+T_CONTRIBUTIONS  = 'contributions'
+T_CAMPAIGNS      = 'contributions_campaigns'
+T_DUES           = 'dues'
+T_DUES_CAMPAIGNS = 'dues_campaigns'
 
 
 def member_required(f):
@@ -168,7 +202,7 @@ def member_required(f):
 def current_member():
     if not session.get('member_id'):
         return None
-    df = load_csv(MEMBERS_FILE)
+    df = load_table(T_MEMBERS, MEMBERS_FILE)
     if df.empty:
         return None
     row = df[df['member_id'] == session['member_id']]
@@ -183,17 +217,15 @@ def safe_amount(v):
 
 
 def sanitize(s, max_len=200):
-    """Strip control chars and trim to max length."""
     if s is None:
         return ''
     s = str(s).strip()
-    # Remove anything that could be used in header injection
     s = s.replace('\r', '').replace('\n', '').replace('\x00', '')
     return s[:max_len]
 
 
 # ═══════════════════════════════════════════════════════════
-# PUBLIC LAYOUT (style.css linked, CSRF meta tag included)
+# PUBLIC LAYOUT
 # ═══════════════════════════════════════════════════════════
 PUBLIC_LAYOUT = r"""<!DOCTYPE html>
 <html lang="en">
@@ -274,9 +306,9 @@ def page(content, **ctx):
 # ═══════════════════════════════════════════════════════════
 @app.route('/')
 def index():
-    members = load_csv(MEMBERS_FILE)
-    polls   = load_csv(POLLS_FILE)
-    camps   = load_csv(CAMPAIGNS_FILE)
+    members = load_table(T_MEMBERS, MEMBERS_FILE)
+    polls   = load_table(T_POLLS, POLLS_FILE)
+    camps   = load_table(T_CAMPAIGNS, CAMPAIGNS_FILE)
 
     content = render_template_string("""
     <div class="hero-section">
@@ -338,13 +370,13 @@ def register():
             flash('Passwords do not match.', 'danger')
             return redirect(url_for('register'))
 
-        members = load_csv(MEMBERS_FILE)
+        members = load_table(T_MEMBERS, MEMBERS_FILE)
         if not members.empty and email in members['email'].str.lower().values:
             flash('This email is already registered. Please log in.', 'warning')
             return redirect(url_for('login'))
 
         mid = f"MEM{int(time.time())}{random.randint(100,999)}"
-        append_row(MEMBERS_FILE, {
+        insert_row(T_MEMBERS, MEMBERS_FILE, {
             'member_id': mid,
             'full_name': full_name,
             'email': email,
@@ -388,31 +420,33 @@ def register():
 
 
 # ═══════════════════════════════════════════════════════════
-# LOGIN  (with rate limiting)
+# LOGIN
 # ═══════════════════════════════════════════════════════════
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     ip = _client_ip()
     if request.method == 'POST':
-        if _is_locked_out(ip):
+        if _locked(ip):
             flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
             return redirect(url_for('login'))
 
         email = sanitize(request.form.get('email', ''), 120).lower()
         pwd   = request.form.get('password', '')
 
-        members = load_csv(MEMBERS_FILE)
+        members = load_table(T_MEMBERS, MEMBERS_FILE)
         ok = False
+        row = None
         if not members.empty:
-            row = members[members['email'].str.lower() == email]
-            if not row.empty:
-                stored = row.iloc[0].get('password_hash', '')
+            sub = members[members['email'].str.lower() == email]
+            if not sub.empty:
+                row = sub
+                stored = sub.iloc[0].get('password_hash', '')
                 try:
                     ok = check_password_hash(stored, pwd)
                 except Exception:
                     ok = False
 
-        if ok:
+        if ok and row is not None:
             _clear_failures(ip)
             session['member_id'] = row.iloc[0]['member_id']
             session.permanent = True
@@ -420,7 +454,7 @@ def login():
             return redirect(url_for('dashboard'))
 
         _record_failure(ip)
-        remaining = _MAX_ATTEMPTS - len(_login_attempts[ip])
+        remaining = _MAX - len(_login_attempts[ip])
         if remaining > 0:
             flash(f'Invalid email or password. {remaining} attempts left.', 'danger')
         else:
@@ -464,9 +498,10 @@ def dashboard():
         flash('Session expired. Please log in again.', 'warning')
         return redirect(url_for('login'))
 
-    votes    = load_csv(VOTES_FILE)
-    dues     = load_csv(DUES_FILE)
-    contribs = load_csv(CONTRIBUTIONS_FILE)
+    votes    = load_table(T_VOTES, VOTES_FILE)
+    dues     = load_table(T_DUES, DUES_FILE)
+    contribs = load_table(T_CONTRIBUTIONS, CONTRIBUTIONS_FILE)
+    members  = load_table(T_MEMBERS, MEMBERS_FILE)
 
     my_votes   = len(votes[votes['member_id'] == m['member_id']]) if not votes.empty else 0
     my_dues    = safe_amount(pd.to_numeric(dues[dues['member_id'] == m['member_id']]['amount'], errors='coerce').fillna(0).sum()) if not dues.empty else 0
@@ -523,17 +558,17 @@ def dashboard():
       <a href="{{ url_for('members_directory') }}"   class="btn btn-secondary">👥 Members</a>
     </div>
     """, m=m, my_votes=my_votes, my_dues=my_dues, my_contrib=my_contrib,
-         member_count=len(load_csv(MEMBERS_FILE)))
+         member_count=len(members))
     return page(content)
 
 
 # ═══════════════════════════════════════════════════════════
-# MEMBERSHIP DIRECTORY
+# MEMBERS DIRECTORY
 # ═══════════════════════════════════════════════════════════
 @app.route('/members')
 @member_required
 def members_directory():
-    df = load_csv(MEMBERS_FILE)
+    df = load_table(T_MEMBERS, MEMBERS_FILE)
     if not df.empty and 'password_hash' in df.columns:
         df = df.drop(columns=['password_hash'])
     members = df.to_dict('records') if not df.empty else []
@@ -595,7 +630,7 @@ def polls_page():
             flash('Please select an option.', 'warning')
             return redirect(url_for('polls_page'))
 
-        votes = load_csv(VOTES_FILE)
+        votes = load_table(T_VOTES, VOTES_FILE)
         already = (not votes.empty and
                    ((votes['poll_id'] == poll_id) &
                     (votes['member_id'] == session['member_id'])).any())
@@ -604,7 +639,7 @@ def polls_page():
             return redirect(url_for('polls_page'))
 
         m = current_member()
-        append_row(VOTES_FILE, {
+        insert_row(T_VOTES, VOTES_FILE, {
             'vote_id':     f"V{int(time.time())}{random.randint(100,999)}",
             'poll_id':     poll_id,
             'option_id':   option_id,
@@ -615,8 +650,8 @@ def polls_page():
         flash('✅ Vote recorded. Thank you!', 'success')
         return redirect(url_for('polls_page'))
 
-    polls = load_csv(POLLS_FILE)
-    votes = load_csv(VOTES_FILE)
+    polls = load_table(T_POLLS, POLLS_FILE)
+    votes = load_table(T_VOTES, VOTES_FILE)
     my_votes = set(votes[votes['member_id'] == session['member_id']]['poll_id'].tolist()) if not votes.empty else set()
 
     poll_list = []
@@ -688,7 +723,7 @@ def dues_page():
 
         if dues_id and amount > 0:
             m = current_member()
-            append_row(DUES_FILE, {
+            insert_row(T_DUES, DUES_FILE, {
                 'payment_id':  f"D{int(time.time())}{random.randint(100,999)}",
                 'dues_id':     dues_id,
                 'member_id':   session['member_id'],
@@ -703,8 +738,8 @@ def dues_page():
             flash('Please enter a valid amount.', 'danger')
         return redirect(url_for('dues_page'))
 
-    plans = load_csv(DUES_CAMPAIGNS_FILE)
-    dues  = load_csv(DUES_FILE)
+    plans = load_table(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE)
+    dues  = load_table(T_DUES, DUES_FILE)
     my_paid = set(dues[dues['member_id'] == session['member_id']]['dues_id'].tolist()) if not dues.empty else set()
 
     rows = []
@@ -775,7 +810,7 @@ def contributions_page():
 
         if cid and amount > 0:
             m = current_member()
-            append_row(CONTRIBUTIONS_FILE, {
+            insert_row(T_CONTRIBUTIONS, CONTRIBUTIONS_FILE, {
                 'contribution_id': f"C{int(time.time())}{random.randint(100,999)}",
                 'campaign_id':     cid,
                 'member_id':       session['member_id'],
@@ -790,8 +825,8 @@ def contributions_page():
             flash('Please enter a valid amount.', 'danger')
         return redirect(url_for('contributions_page'))
 
-    camps    = load_csv(CAMPAIGNS_FILE)
-    contribs = load_csv(CONTRIBUTIONS_FILE)
+    camps    = load_table(T_CAMPAIGNS, CAMPAIGNS_FILE)
+    contribs = load_table(T_CONTRIBUTIONS, CONTRIBUTIONS_FILE)
     rows = []
     if not camps.empty:
         for _, c in camps.iterrows():
@@ -858,11 +893,12 @@ def contributions_page():
 # ═══════════════════════════════════════════════════════════
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
+    return jsonify({
+        'status': 'ok',
+        'supabase_enabled': sb.SUPABASE_ENABLED,
+        'time': datetime.now().isoformat()
+    })
 
 
-# ═══════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=5000)
