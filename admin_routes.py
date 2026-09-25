@@ -1,8 +1,8 @@
 """
-admin_routes.py — ODADEAƐ07 Admin Panel (Supabase-aware, 25 reports)
+admin_routes.py — ODADEAƐ07 Admin Panel (Supabase-aware, 25+ reports)
 
-New member fields: title, middle_name, dob_day, dob_month,
-emergency_contact, job_title, industry.
+Member fields: title, first_name, middle_name, last_name,
+dob_day, dob_month, dob_year, emergency_contact, job_title, industry.
 """
 
 import os
@@ -175,6 +175,13 @@ def _sanitize(s, max_len=200):
         return ''
     s = str(s).strip().replace('\r', '').replace('\n', '').replace('\x00', '')
     return s[:max_len]
+
+
+def _build_full_name(first, middle, last):
+    parts = [str(first or '').strip(),
+             str(middle or '').strip(),
+             str(last or '').strip()]
+    return ' '.join(p for p in parts if p)
 
 
 def _csv_response(rows, filename):
@@ -391,7 +398,7 @@ def home():
       <a href="{{ url_for('admin.dues') }}"    class="btn btn-primary">📅 Manage Dues</a>
       <a href="{{ url_for('admin.members') }}" class="btn btn-primary">👥 Manage Members</a>
       <a href="{{ url_for('admin.reports') }}" class="btn btn-secondary">📈 Reports & Downloads</a>
-      <a href="{{ url_for('admin.backup') }}"  class="btn btn-secondary">💾 Download Full Backup (ZIP)</a>
+      <a href="{{ url_for('admin.backup') }}"  class="btn btn-secondary">💾 Full Backup (ZIP)</a>
     </div>
     """, s=stats)
     return _page(body)
@@ -930,7 +937,7 @@ def dues():
 
 
 # ─────────────────────────────────────────────────────────
-# MEMBERS (manage, with new fields)
+# MEMBERS
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/members', methods=['GET', 'POST'])
 @_admin_required
@@ -939,29 +946,35 @@ def members():
         action = request.form.get('action', 'add')
 
         if action == 'add':
-            full_name         = _sanitize(request.form.get('full_name', ''), 120)
+            first_name        = _sanitize(request.form.get('first_name', ''), 120)
+            middle_name       = _sanitize(request.form.get('middle_name', ''), 120)
+            last_name         = _sanitize(request.form.get('last_name', ''), 120)
             email             = _sanitize(request.form.get('email', ''), 120).lower()
             title             = _sanitize(request.form.get('title', ''), 20)
-            middle_name       = _sanitize(request.form.get('middle_name', ''), 120)
             phone             = _sanitize(request.form.get('phone', ''), 40)
             dob_day           = _sanitize(request.form.get('dob_day', ''), 2)
             dob_month         = _sanitize(request.form.get('dob_month', ''), 20)
+            dob_year          = _sanitize(request.form.get('dob_year', ''), 4)
             house             = _sanitize(request.form.get('house', ''), 60)
             emergency_contact = _sanitize(request.form.get('emergency_contact', ''), 200)
             job_title         = _sanitize(request.form.get('job_title', ''), 120)
             industry          = _sanitize(request.form.get('industry', ''), 120)
 
-            if full_name and email:
+            if first_name and last_name and email:
                 from werkzeug.security import generate_password_hash
+                full_name = _build_full_name(first_name, middle_name, last_name)
                 _insert(T_MEMBERS, MEMBERS_FILE, {
                     'member_id':         f"MEM{int(time.time())}{random.randint(100,999)}",
                     'title':             title,
-                    'full_name':         full_name,
+                    'first_name':        first_name,
                     'middle_name':       middle_name,
-                    'email':             email,
-                    'phone':             phone,
+                    'last_name':         last_name,
+                    'full_name':         full_name,
                     'dob_day':           dob_day,
                     'dob_month':         dob_month,
+                    'dob_year':          dob_year,
+                    'email':             email,
+                    'phone':             phone,
                     'house':             house,
                     'emergency_contact': emergency_contact,
                     'job_title':         job_title,
@@ -971,18 +984,24 @@ def members():
                 })
                 flash(f'✅ Member added: {full_name} (default password: changeme123)', 'success')
             else:
-                flash('Name and email required.', 'danger')
+                flash('First name, last name and email required.', 'danger')
 
         elif action == 'edit':
             mid = request.form.get('member_id')
+            first_name  = _sanitize(request.form.get('first_name', ''), 120)
+            middle_name = _sanitize(request.form.get('middle_name', ''), 120)
+            last_name   = _sanitize(request.form.get('last_name', ''), 120)
             updates = {
                 'title':             _sanitize(request.form.get('title', ''), 20),
-                'full_name':         _sanitize(request.form.get('full_name', ''), 120),
-                'middle_name':       _sanitize(request.form.get('middle_name', ''), 120),
+                'first_name':        first_name,
+                'middle_name':       middle_name,
+                'last_name':         last_name,
+                'full_name':         _build_full_name(first_name, middle_name, last_name),
                 'email':             _sanitize(request.form.get('email', ''), 120).lower(),
                 'phone':             _sanitize(request.form.get('phone', ''), 40),
                 'dob_day':           _sanitize(request.form.get('dob_day', ''), 2),
                 'dob_month':         _sanitize(request.form.get('dob_month', ''), 20),
+                'dob_year':          _sanitize(request.form.get('dob_year', ''), 4),
                 'house':             _sanitize(request.form.get('house', ''), 60),
                 'emergency_contact': _sanitize(request.form.get('emergency_contact', ''), 200),
                 'job_title':         _sanitize(request.form.get('job_title', ''), 120),
@@ -1014,7 +1033,6 @@ def members():
         <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-secondary">⬇ All Members</a>
         <a href="{{ url_for('admin.report', kind='members_full_profile') }}" class="btn btn-secondary">⬇ Full Profiles</a>
         <a href="{{ url_for('admin.report', kind='members_by_house') }}" class="btn btn-secondary">⬇ By House</a>
-        <a href="{{ url_for('admin.report', kind='contact_directory') }}" class="btn btn-secondary">⬇ Contacts</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
@@ -1037,18 +1055,22 @@ def members():
         </div>
         <div class="form-row">
           <div class="form-group"><label>First Name *</label>
-            <input name="full_name" required maxlength="120"></div>
+            <input name="first_name" required maxlength="120"></div>
           <div class="form-group"><label>Middle Name</label>
             <input name="middle_name" maxlength="120"></div>
         </div>
-        <div class="form-row">
-          <div class="form-group"><label>DOB — Day</label>
+        <div class="form-group"><label>Last Name *</label>
+          <input name="last_name" required maxlength="120"></div>
+        <div class="form-row" style="grid-template-columns: 1fr 2fr 1fr;">
+          <div class="form-group"><label>DOB Day</label>
             <input name="dob_day" type="number" min="1" max="31"></div>
-          <div class="form-group"><label>DOB — Month</label>
+          <div class="form-group"><label>DOB Month</label>
             <select name="dob_month">
               <option value="">—</option>
               {% for m in months %}<option>{{ m }}</option>{% endfor %}
             </select></div>
+          <div class="form-group"><label>DOB Year</label>
+            <input name="dob_year" type="number" min="1900" max="2026"></div>
         </div>
         <div class="form-row">
           <div class="form-group"><label>Email *</label>
@@ -1057,7 +1079,7 @@ def members():
             <input name="phone" maxlength="40"></div>
         </div>
         <div class="form-group"><label>Emergency Contact</label>
-          <input name="emergency_contact" placeholder="Name + phone" maxlength="200"></div>
+          <input name="emergency_contact" maxlength="200"></div>
         <div class="form-row">
           <div class="form-group"><label>Job Title</label>
             <input name="job_title" maxlength="120"></div>
@@ -1071,22 +1093,21 @@ def members():
     <div class="table-wrapper">
       <table class="report-table full-width">
         <thead><tr>
-          <th>Name</th><th>Email</th><th>Phone</th><th>House</th>
-          <th>DOB</th><th>Emergency</th><th>Job</th><th>Industry</th><th>Actions</th>
+          <th>Name</th><th>Email</th><th>DOB</th><th>Phone</th>
+          <th>House</th><th>Job</th><th>Industry</th><th>Actions</th>
         </tr></thead>
         <tbody>
         {% for m in rows %}
           <tr>
-            <td><strong>{{ m.get('title','') }} {{ m.get('full_name','') }} {{ m.get('middle_name','') }}</strong></td>
+            <td><strong>{{ m.get('title','') }} {{ m.get('first_name') or m.get('full_name','') }} {{ m.get('middle_name','') }} {{ m.get('last_name','') }}</strong></td>
             <td>{{ m.get('email','') }}</td>
-            <td>{{ m.get('phone','') or '—' }}</td>
-            <td>{{ m.get('house','') or '—' }}</td>
             <td>
-              {% if m.get('dob_day') or m.get('dob_month') %}
-                {{ m.get('dob_day','') }} {{ m.get('dob_month','') }}
+              {% if m.get('dob_day') or m.get('dob_month') or m.get('dob_year') %}
+                {{ m.get('dob_day','') }} {{ m.get('dob_month','') }} {{ m.get('dob_year','') }}
               {% else %}—{% endif %}
             </td>
-            <td>{{ m.get('emergency_contact','') or '—' }}</td>
+            <td>{{ m.get('phone','') or '—' }}</td>
+            <td>{{ m.get('house','') or '—' }}</td>
             <td>{{ m.get('job_title','') or '—' }}</td>
             <td>{{ m.get('industry','') or '—' }}</td>
             <td>
@@ -1109,21 +1130,26 @@ def members():
                   </div>
                   <div class="form-row">
                     <div class="form-group"><label>First Name</label>
-                      <input name="full_name" value="{{ m.get('full_name','') }}" maxlength="120"></div>
+                      <input name="first_name" value="{{ m.get('first_name','') }}" maxlength="120"></div>
                     <div class="form-group"><label>Middle Name</label>
                       <input name="middle_name" value="{{ m.get('middle_name','') }}" maxlength="120"></div>
                   </div>
-                  <div class="form-row">
-                    <div class="form-group"><label>DOB — Day</label>
+                  <div class="form-group"><label>Last Name</label>
+                    <input name="last_name" value="{{ m.get('last_name','') }}" maxlength="120"></div>
+                  <div class="form-row" style="grid-template-columns: 1fr 2fr 1fr;">
+                    <div class="form-group"><label>DOB Day</label>
                       <input name="dob_day" type="number" min="1" max="31"
                              value="{{ m.get('dob_day','') }}"></div>
-                    <div class="form-group"><label>DOB — Month</label>
+                    <div class="form-group"><label>DOB Month</label>
                       <select name="dob_month">
                         <option value="">—</option>
                         {% for mo in months %}
                           <option {% if m.get('dob_month') == mo %}selected{% endif %}>{{ mo }}</option>
                         {% endfor %}
                       </select></div>
+                    <div class="form-group"><label>DOB Year</label>
+                      <input name="dob_year" type="number" min="1900" max="2026"
+                             value="{{ m.get('dob_year','') }}"></div>
                   </div>
                   <div class="form-row">
                     <div class="form-group"><label>Email</label>
@@ -1152,7 +1178,7 @@ def members():
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="9" class="empty-state">No members yet.</td></tr>
+          <tr><td colspan="8" class="empty-state">No members yet.</td></tr>
         {% endfor %}
         </tbody>
       </table>
@@ -1181,7 +1207,7 @@ def reports():
     body = render_template_string("""
     <div class="reports-header">
       <div><h1>📈 Reports & Downloads</h1>
-      <p class="subtitle">25 reports • all downloadable as CSV</p></div>
+      <p class="subtitle">All reports • downloadable as CSV</p></div>
       <div class="report-actions">
         <a href="{{ url_for('admin.backup') }}" class="btn btn-primary">💾 Full Backup (ZIP)</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
@@ -1208,22 +1234,11 @@ def reports():
       <h2>🗳️ Voting Reports</h2>
       <div class="report-cards-grid">
         <div class="report-card"><h3>All Polls</h3>
-          <p>Every poll with totals and winner.</p>
           <a href="{{ url_for('admin.report', kind='all_polls') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>All Votes</h3>
-          <p>Every vote ever cast.</p>
           <a href="{{ url_for('admin.report', kind='all_votes') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>Turnout by Poll</h3>
-          <p>Participation per poll.</p>
           <a href="{{ url_for('admin.report', kind='turnout') }}" class="btn btn-primary">⬇ Download</a></div>
-      </div>
-      <div class="form-container" style="max-width:520px;margin-top:1rem;">
-        <h3>Specific Poll Report</h3>
-        <form method="GET" action="{{ url_for('admin.report', kind='poll') }}">
-          <div class="form-group"><label>Poll ID</label>
-            <input name="poll_id" placeholder="POLL1234..." required></div>
-          <button class="btn btn-primary">⬇ Download</button>
-        </form>
       </div>
     </div>
 
@@ -1239,21 +1254,6 @@ def reports():
         <div class="report-card"><h3>Top Dues Payers</h3>
           <a href="{{ url_for('admin.report', kind='top_dues_payers') }}" class="btn btn-primary">⬇ Download</a></div>
       </div>
-      <div class="form-container" style="max-width:520px;margin-top:1rem;">
-        <h3>Specific Month Report</h3>
-        <form method="GET" action="{{ url_for('admin.report', kind='dues_month') }}">
-          <div class="form-row">
-            <div class="form-group"><label>Month</label>
-              <select name="month" required>
-                <option value="">—</option>
-                {% for m in months %}<option>{{ m }}</option>{% endfor %}
-              </select></div>
-            <div class="form-group"><label>Year</label>
-              <input name="year" placeholder="2026" required></div>
-          </div>
-          <button class="btn btn-primary">⬇ Download</button>
-        </form>
-      </div>
     </div>
 
     <div class="report-section">
@@ -1268,24 +1268,15 @@ def reports():
         <div class="report-card"><h3>Top Contributors</h3>
           <a href="{{ url_for('admin.report', kind='top_contributors') }}" class="btn btn-primary">⬇ Download</a></div>
       </div>
-      <div class="form-container" style="max-width:520px;margin-top:1rem;">
-        <h3>Specific Campaign Report</h3>
-        <form method="GET" action="{{ url_for('admin.report', kind='campaign') }}">
-          <div class="form-group"><label>Campaign ID</label>
-            <input name="campaign_id" placeholder="CAMP1234..." required></div>
-          <button class="btn btn-primary">⬇ Download</button>
-        </form>
-      </div>
     </div>
 
     <div class="report-section">
       <h2>👥 Membership Reports</h2>
       <div class="report-cards-grid">
         <div class="report-card"><h3>All Members</h3>
-          <p>Full directory (basic fields).</p>
           <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>Full Member Profiles</h3>
-          <p>Every field — title, DOB, job, industry, emergency contact.</p>
+          <p>Every field including DOB, job, industry.</p>
           <a href="{{ url_for('admin.report', kind='members_full_profile') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>By House</h3>
           <a href="{{ url_for('admin.report', kind='members_by_house') }}" class="btn btn-primary">⬇ Download</a></div>
@@ -1296,14 +1287,20 @@ def reports():
         <div class="report-card"><h3>Contact Directory</h3>
           <a href="{{ url_for('admin.report', kind='contact_directory') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>Members by Industry</h3>
-          <p>Grouped by industry for networking.</p>
           <a href="{{ url_for('admin.report', kind='members_by_industry') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>Members by Job Title</h3>
-          <p>Grouped by job title.</p>
           <a href="{{ url_for('admin.report', kind='members_by_job') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Birthdays This Month</h3>
-          <p>Members born in a chosen month.</p>
-          <a href="{{ url_for('admin.report', kind='birthdays') }}" class="btn btn-primary">⬇ Download</a></div>
+        <div class="report-card"><h3>Birthdays</h3>
+          <form method="GET" action="{{ url_for('admin.report', kind='birthdays') }}">
+            <div class="form-group" style="margin-bottom:0.5rem;">
+              <select name="month">
+                <option value="">All months</option>
+                {% for m in months %}<option>{{ m }}</option>{% endfor %}
+              </select>
+            </div>
+            <button class="btn btn-primary">⬇ Download</button>
+          </form>
+        </div>
       </div>
     </div>
 
@@ -1314,8 +1311,6 @@ def reports():
           <a href="{{ url_for('admin.report', kind='master_financial') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>Executive Summary</h3>
           <a href="{{ url_for('admin.report', kind='executive_summary') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Full Backup (ZIP)</h3>
-          <a href="{{ url_for('admin.backup') }}" class="btn btn-primary">⬇ Download</a></div>
       </div>
     </div>
     """,
@@ -1326,7 +1321,7 @@ def reports():
 
 
 # ═══════════════════════════════════════════════════════════
-# REPORT DOWNLOAD ROUTER — all 25 reports
+# REPORT ROUTER
 # ═══════════════════════════════════════════════════════════
 @admin_bp.route('/report/<kind>')
 @_admin_required
@@ -1349,7 +1344,6 @@ def report(kind):
     def _records(df):
         return df.to_dict('records') if not df.empty else []
 
-    # ═══════ POLLS / VOTES ═══════
     if kind == 'all_polls':
         rows = []
         member_count = len(members)
@@ -1380,8 +1374,6 @@ def report(kind):
 
     if kind == 'poll':
         poll_id = request.args.get('poll_id', '')
-        if not poll_id:
-            flash('Missing poll_id.', 'danger'); return redirect(url_for('admin.reports'))
         p = polls[polls['poll_id'] == poll_id] if not polls.empty else pd.DataFrame()
         if p.empty:
             flash('Poll not found.', 'danger'); return redirect(url_for('admin.reports'))
@@ -1392,8 +1384,7 @@ def report(kind):
             opts = []
         pv = votes[votes['poll_id'] == poll_id] if not votes.empty else pd.DataFrame()
         tally = pv['option_id'].value_counts().to_dict() if not pv.empty else {}
-        total = len(pv)
-        member_count = len(members)
+        total = len(pv); member_count = len(members)
         rows = []
         for o in opts:
             c = tally.get(o['id'], 0)
@@ -1445,7 +1436,6 @@ def report(kind):
             })
         return _csv_response(rows, f'turnout_{ts}.csv')
 
-    # ═══════ DUES ═══════
     if kind == 'all_dues_plans':
         member_count = len(members)
         rows = []
@@ -1531,12 +1521,10 @@ def report(kind):
         grouped = grouped.sort_values('amount', ascending=False)
         rows = []
         for i, r in enumerate(grouped.to_dict('records'), 1):
-            r['rank'] = i
-            r['total_paid'] = r.pop('amount')
+            r['rank'] = i; r['total_paid'] = r.pop('amount')
             rows.append(r)
         return _csv_response(rows, f'top_dues_payers_{ts}.csv')
 
-    # ═══════ CONTRIBUTIONS ═══════
     if kind == 'all_campaigns':
         member_count = len(members)
         rows = []
@@ -1569,8 +1557,7 @@ def report(kind):
         sub = contribs[contribs['campaign_id'] == cid] if not contribs.empty else pd.DataFrame()
         rows = _records(sub)
         for r in rows:
-            r['campaign_id'] = cid
-            r['campaign_title'] = c['title']
+            r['campaign_id'] = cid; r['campaign_title'] = c['title']
         return _csv_response(rows, f'campaign_{cid}_{ts}.csv')
 
     if kind == 'all_contributions':
@@ -1616,12 +1603,10 @@ def report(kind):
         grouped = grouped.sort_values('amount', ascending=False)
         rows = []
         for i, r in enumerate(grouped.to_dict('records'), 1):
-            r['rank'] = i
-            r['total_contributed'] = r.pop('amount')
+            r['rank'] = i; r['total_contributed'] = r.pop('amount')
             rows.append(r)
         return _csv_response(rows, f'top_contributors_{ts}.csv')
 
-    # ═══════ MEMBERSHIP ═══════
     if kind == 'all_members':
         df = members.copy()
         if 'password_hash' in df.columns:
@@ -1634,15 +1619,16 @@ def report(kind):
         df = members.copy()
         if 'password_hash' in df.columns:
             df = df.drop(columns=['password_hash'])
-        # Ensure all new columns are present even if some older rows lack them
-        for col in ['title','middle_name','dob_day','dob_month',
+        for col in ['title','first_name','middle_name','last_name',
+                    'dob_day','dob_month','dob_year',
                     'emergency_contact','job_title','industry']:
             if col not in df.columns:
                 df[col] = ''
-        # Ensure a stable order
-        desired = ['member_id','title','full_name','middle_name',
-                   'dob_day','dob_month','email','phone','house',
-                   'emergency_contact','job_title','industry','registered_at']
+        desired = ['member_id','title','first_name','middle_name','last_name',
+                   'dob_day','dob_month','dob_year',
+                   'email','phone','house',
+                   'emergency_contact','job_title','industry',
+                   'registered_at','full_name']
         ordered = [c for c in desired if c in df.columns]
         extra = [c for c in df.columns if c not in ordered]
         df = df[ordered + extra]
@@ -1658,10 +1644,7 @@ def report(kind):
         rows = []
         for _, r in grouped.iterrows():
             names = df[df['house'] == r['house']]['full_name'].tolist()
-            rows.append({
-                'house': r['house'], 'count': r['count'],
-                'members': '; '.join(names),
-            })
+            rows.append({'house': r['house'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_house_{ts}.csv')
 
     if kind == 'members_by_year':
@@ -1674,10 +1657,7 @@ def report(kind):
         rows = []
         for _, r in grouped.iterrows():
             names = df[df['reg_month'] == r['reg_month']]['full_name'].tolist()
-            rows.append({
-                'month': r['reg_month'], 'count': r['count'],
-                'members': '; '.join(names),
-            })
+            rows.append({'month': r['reg_month'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_year_{ts}.csv')
 
     if kind == 'inactive_members':
@@ -1694,10 +1674,9 @@ def report(kind):
     if kind == 'contact_directory':
         if members.empty:
             return _csv_response([], f'contact_directory_{ts}.csv')
-        cols = ['title','full_name','middle_name','email','phone','house']
+        cols = ['title','first_name','middle_name','last_name','email','phone','house']
         cols = [c for c in cols if c in members.columns]
-        df = members[cols].copy()
-        return _csv_response(_records(df), f'contact_directory_{ts}.csv')
+        return _csv_response(_records(members[cols]), f'contact_directory_{ts}.csv')
 
     if kind == 'members_by_industry':
         df = members.copy()
@@ -1709,10 +1688,7 @@ def report(kind):
         rows = []
         for _, r in grouped.iterrows():
             names = df[df['industry'] == r['industry']]['full_name'].tolist()
-            rows.append({
-                'industry': r['industry'], 'count': r['count'],
-                'members': '; '.join(names),
-            })
+            rows.append({'industry': r['industry'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_industry_{ts}.csv')
 
     if kind == 'members_by_job':
@@ -1725,10 +1701,7 @@ def report(kind):
         rows = []
         for _, r in grouped.iterrows():
             names = df[df['job_title'] == r['job_title']]['full_name'].tolist()
-            rows.append({
-                'job_title': r['job_title'], 'count': r['count'],
-                'members': '; '.join(names),
-            })
+            rows.append({'job_title': r['job_title'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_job_{ts}.csv')
 
     if kind == 'birthdays':
@@ -1742,16 +1715,19 @@ def report(kind):
         rows = []
         for _, m in df.iterrows():
             rows.append({
-                'title': m.get('title',''), 'full_name': m.get('full_name',''),
+                'title': m.get('title',''),
+                'first_name': m.get('first_name',''),
                 'middle_name': m.get('middle_name',''),
+                'last_name': m.get('last_name',''),
                 'dob_day': m.get('dob_day',''),
                 'dob_month': m.get('dob_month',''),
-                'email': m.get('email',''), 'phone': m.get('phone',''),
+                'dob_year': m.get('dob_year',''),
+                'email': m.get('email',''),
+                'phone': m.get('phone',''),
                 'house': m.get('house',''),
             })
         return _csv_response(rows, f'birthdays_{ts}.csv')
 
-    # ═══════ COMBINED ═══════
     if kind == 'master_financial':
         rows = []
         for _, r in dues_payments.iterrows():
@@ -1811,7 +1787,7 @@ def report(kind):
 
 
 # ═══════════════════════════════════════════════════════════
-# FULL BACKUP (ZIP)
+# FULL BACKUP
 # ═══════════════════════════════════════════════════════════
 @admin_bp.route('/backup')
 @_admin_required
@@ -1836,17 +1812,13 @@ def backup():
         zf.writestr('README.txt',
                     f'ODADEAƐ07 Backup\n'
                     f'Generated: {datetime.now().isoformat()}\n'
-                    f'Source: {"Supabase" if sb.SUPABASE_ENABLED else "Local CSV"}\n'
-                    f'Tables: {len(tables)}\n')
+                    f'Source: {"Supabase" if sb.SUPABASE_ENABLED else "Local CSV"}\n')
     buf.seek(0)
     return send_file(buf, mimetype='application/zip',
                      as_attachment=True,
                      download_name=f'odadea07_backup_{ts}.zip')
 
 
-# ═══════════════════════════════════════════════════════════
-# LEGACY DOWNLOAD ROUTE
-# ═══════════════════════════════════════════════════════════
 @admin_bp.route('/download/<kind>')
 @_admin_required
 def download(kind):
