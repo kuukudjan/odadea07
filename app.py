@@ -1,16 +1,16 @@
 """
 app.py — ODADEAƐ07 Main Application (Secured, Supabase-aware, Password Reset)
 
-Adds:
-  • /forgot-password  — request reset link by email
-  • /reset-password   — set new password via token
+New member fields (2026-09):
+  • title             — Mr / Mrs / Dr / Rev / etc.
+  • middle_name       — member's middle name
+  • dob_day           — day of birth (1–31)
+  • dob_month         — month of birth (January–December)
+  • emergency_contact — name + phone of emergency contact
+  • job_title         — e.g. Accountant, Engineer
+  • industry          — e.g. Finance, Technology
 
-Security:
-  • CSRF on all forms
-  • Secure / HttpOnly / SameSite cookies
-  • Login rate limiting
-  • Password reset tokens: 1-hour expiry, one-time use, cryptographically random
-  • Rate limiting on reset requests (prevents email spam)
+Note: no birth year is collected — only day and month.
 """
 
 import os
@@ -194,6 +194,10 @@ def sanitize(s, max_len=200):
     return s[:max_len]
 
 
+MONTHS = ['January','February','March','April','May','June',
+          'July','August','September','October','November','December']
+
+
 # ═══════════════════════════════════════════════════════════
 # PUBLIC LAYOUT
 # ═══════════════════════════════════════════════════════════
@@ -318,12 +322,19 @@ def index():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        full_name = sanitize(request.form.get('full_name', ''), 120)
-        email     = sanitize(request.form.get('email', ''), 120).lower()
-        phone     = sanitize(request.form.get('phone', ''), 40)
-        house     = sanitize(request.form.get('house', ''), 60)
-        password  = request.form.get('password', '')
-        confirm   = request.form.get('confirm', '')
+        title             = sanitize(request.form.get('title', ''), 20)
+        full_name         = sanitize(request.form.get('full_name', ''), 120)
+        middle_name       = sanitize(request.form.get('middle_name', ''), 120)
+        email             = sanitize(request.form.get('email', ''), 120).lower()
+        phone             = sanitize(request.form.get('phone', ''), 40)
+        dob_day           = sanitize(request.form.get('dob_day', ''), 2)
+        dob_month         = sanitize(request.form.get('dob_month', ''), 20)
+        house             = sanitize(request.form.get('house', ''), 60)
+        emergency_contact = sanitize(request.form.get('emergency_contact', ''), 200)
+        job_title         = sanitize(request.form.get('job_title', ''), 120)
+        industry          = sanitize(request.form.get('industry', ''), 120)
+        password          = request.form.get('password', '')
+        confirm           = request.form.get('confirm', '')
 
         if not (full_name and email and password):
             flash('Name, email and password are required.', 'danger')
@@ -338,6 +349,16 @@ def register():
             flash('Passwords do not match.', 'danger')
             return redirect(url_for('register'))
 
+        # Validate DOB day if provided
+        if dob_day:
+            try:
+                d = int(dob_day)
+                if d < 1 or d > 31:
+                    raise ValueError
+            except ValueError:
+                flash('Date of birth day must be a number between 1 and 31.', 'danger')
+                return redirect(url_for('register'))
+
         members = load_table(T_MEMBERS, MEMBERS_FILE)
         if not members.empty and email in members['email'].str.lower().values:
             flash('This email is already registered. Please log in.', 'warning')
@@ -345,13 +366,20 @@ def register():
 
         mid = f"MEM{int(time.time())}{random.randint(100,999)}"
         insert_row(T_MEMBERS, MEMBERS_FILE, {
-            'member_id': mid,
-            'full_name': full_name,
-            'email': email,
-            'phone': phone,
-            'house': house,
-            'password_hash': generate_password_hash(password),
-            'registered_at': datetime.now().isoformat(),
+            'member_id':         mid,
+            'title':             title,
+            'full_name':         full_name,
+            'middle_name':       middle_name,
+            'email':             email,
+            'phone':             phone,
+            'dob_day':           dob_day,
+            'dob_month':         dob_month,
+            'house':             house,
+            'emergency_contact': emergency_contact,
+            'job_title':         job_title,
+            'industry':          industry,
+            'password_hash':     generate_password_hash(password),
+            'registered_at':     datetime.now().isoformat(),
         })
         flash(f'Welcome, {full_name}! Please log in.', 'success')
         return redirect(url_for('login'))
@@ -362,28 +390,68 @@ def register():
       <p class="form-subtitle">Register as a member of the 2007 Year Group</p>
       <form method="POST">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <div class="form-group"><label>Full Name *</label>
-          <input name="full_name" required maxlength="120"></div>
+
+        <h3 style="margin-bottom:0.5rem;color:var(--presec-blue);">Personal details</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Title</label>
+            <select name="title">
+              <option value="">—</option>
+              <option>Mr</option><option>Mrs</option><option>Miss</option>
+              <option>Dr</option><option>Rev</option><option>Prof</option>
+              <option>Hon</option><option>Nana</option><option>Nii</option>
+            </select></div>
+          <div class="form-group"><label>House</label>
+            <input name="house" placeholder="e.g. Akro, Labone" maxlength="60"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>First Name *</label>
+            <input name="full_name" required maxlength="120" placeholder="First name"></div>
+          <div class="form-group"><label>Middle Name</label>
+            <input name="middle_name" maxlength="120"></div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group"><label>Date of Birth — Day</label>
+            <input name="dob_day" type="number" min="1" max="31" placeholder="e.g. 15"></div>
+          <div class="form-group"><label>Date of Birth — Month</label>
+            <select name="dob_month">
+              <option value="">—</option>
+              {% for m in months %}<option>{{ m }}</option>{% endfor %}
+            </select></div>
+        </div>
+
+        <h3 style="margin:1rem 0 0.5rem;color:var(--presec-blue);">Contact details</h3>
         <div class="form-group"><label>Email *</label>
           <input type="email" name="email" required maxlength="120"></div>
         <div class="form-row">
           <div class="form-group"><label>Phone</label>
             <input name="phone" placeholder="+233 ..." maxlength="40"></div>
-          <div class="form-group"><label>House</label>
-            <input name="house" placeholder="e.g. Akro, Labone" maxlength="60"></div>
+          <div class="form-group"><label>Emergency Contact</label>
+            <input name="emergency_contact" placeholder="Name + phone" maxlength="200"></div>
         </div>
+
+        <h3 style="margin:1rem 0 0.5rem;color:var(--presec-blue);">Professional details</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Job Title</label>
+            <input name="job_title" placeholder="e.g. Accountant" maxlength="120"></div>
+          <div class="form-group"><label>Industry</label>
+            <input name="industry" placeholder="e.g. Finance, Tech" maxlength="120"></div>
+        </div>
+
+        <h3 style="margin:1rem 0 0.5rem;color:var(--presec-blue);">Account</h3>
         <div class="form-row">
           <div class="form-group"><label>Password * (min 8 chars)</label>
             <input type="password" name="password" required minlength="8"></div>
           <div class="form-group"><label>Confirm Password *</label>
             <input type="password" name="confirm" required minlength="8"></div>
         </div>
+
         <button class="btn btn-primary btn-full">Create Account</button>
       </form>
       <p class="form-footer">Already registered?
         <a href="{{ url_for('login') }}">Log in</a></p>
     </div>
-    """)
+    """, months=MONTHS)
     return page(content)
 
 
@@ -457,7 +525,7 @@ def logout():
 
 
 # ═══════════════════════════════════════════════════════════
-# FORGOT PASSWORD — request reset link
+# FORGOT PASSWORD
 # ═══════════════════════════════════════════════════════════
 @app.route('/forgot-password', methods=['GET', 'POST'])
 def forgot_password():
@@ -468,9 +536,6 @@ def forgot_password():
             return redirect(url_for('forgot_password'))
 
         email = sanitize(request.form.get('email', ''), 120).lower()
-
-        # Always show the same message, whether or not the email exists
-        # (prevents attackers from enumerating registered emails)
         success_msg = ('If that email is registered, a reset link has been sent. '
                        'Check your inbox and spam folder.')
 
@@ -493,7 +558,6 @@ def forgot_password():
                 email, member.get('full_name', 'Odadeɛ'), reset_url
             )
             if not ok:
-                # Log the link so admin can still help if email fails
                 print(f'[forgot-password] Email failed for {email}: {err}')
                 print(f'[forgot-password] Manual link: {reset_url}')
 
@@ -520,13 +584,11 @@ def forgot_password():
 
 
 # ═══════════════════════════════════════════════════════════
-# RESET PASSWORD — set new password via token
+# RESET PASSWORD
 # ═══════════════════════════════════════════════════════════
 @app.route('/reset-password', methods=['GET', 'POST'])
 def reset_password():
     token = request.args.get('token', '') or request.form.get('token', '')
-
-    # Verify token before showing the form
     row = pr.verify_token(token)
     if not row:
         content = render_template_string("""
@@ -599,15 +661,19 @@ def dashboard():
     my_dues    = safe_amount(pd.to_numeric(dues[dues['member_id'] == m['member_id']]['amount'], errors='coerce').fillna(0).sum()) if not dues.empty else 0
     my_contrib = safe_amount(pd.to_numeric(contribs[contribs['member_id'] == m['member_id']]['amount'], errors='coerce').fillna(0).sum()) if not contribs.empty else 0
 
+    full_name_display = ' '.join(filter(None, [
+        m.get('title', ''), m.get('full_name', ''), m.get('middle_name', '')
+    ]))
+
     content = render_template_string("""
     <div class="dashboard-header">
       <div>
-        <h1>Akwaaba, {{ m.full_name }}</h1>
+        <h1>Akwaaba, {{ display_name }}</h1>
         <p>{{ m.email }}{% if m.house %} • {{ m.house }} House{% endif %}</p>
       </div>
       <div class="member-info">
         <div class="member-photo-placeholder">
-          {{ m.full_name[0]|upper if m.full_name else '?' }}
+          {{ (m.full_name[0] if m.full_name else '?')|upper }}
         </div>
       </div>
     </div>
@@ -643,14 +709,40 @@ def dashboard():
       </div>
     </div>
 
+    <div class="report-section">
+      <h2>📇 My Profile</h2>
+      <div class="table-wrapper">
+        <table class="report-table full-width">
+          <tbody>
+            <tr><th>Title</th><td>{{ m.get('title','') or '—' }}</td></tr>
+            <tr><th>Full Name</th><td>{{ m.full_name }}</td></tr>
+            <tr><th>Middle Name</th><td>{{ m.get('middle_name','') or '—' }}</td></tr>
+            <tr><th>Date of Birth</th>
+                <td>{% if m.get('dob_day') or m.get('dob_month') %}
+                      {{ m.get('dob_day','') }} {{ m.get('dob_month','') }}
+                    {% else %}—{% endif %}</td></tr>
+            <tr><th>Email</th><td>{{ m.email }}</td></tr>
+            <tr><th>Phone</th><td>{{ m.get('phone','') or '—' }}</td></tr>
+            <tr><th>House</th><td>{{ m.get('house','') or '—' }}</td></tr>
+            <tr><th>Emergency Contact</th><td>{{ m.get('emergency_contact','') or '—' }}</td></tr>
+            <tr><th>Job Title</th><td>{{ m.get('job_title','') or '—' }}</td></tr>
+            <tr><th>Industry</th><td>{{ m.get('industry','') or '—' }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="margin-top:1rem;color:var(--gray-500);font-size:0.9rem;">
+        To update your profile, contact the admin.
+      </p>
+    </div>
+
     <div class="admin-actions">
       <a href="{{ url_for('polls_page') }}"          class="btn btn-primary">🗳️ Vote in Polls</a>
       <a href="{{ url_for('dues_page') }}"           class="btn btn-primary">📅 Pay Dues</a>
       <a href="{{ url_for('contributions_page') }}"  class="btn btn-primary">🎯 Contribute</a>
       <a href="{{ url_for('members_directory') }}"   class="btn btn-secondary">👥 Members</a>
     </div>
-    """, m=m, my_votes=my_votes, my_dues=my_dues, my_contrib=my_contrib,
-         member_count=len(members))
+    """, m=m, display_name=full_name_display, my_votes=my_votes,
+         my_dues=my_dues, my_contrib=my_contrib, member_count=len(members))
     return page(content)
 
 
@@ -687,14 +779,19 @@ def members_directory():
       <div class="table-wrapper">
         <table class="report-table full-width">
           <thead>
-            <tr><th>Name</th><th>Email</th><th>Phone</th><th>Joined</th></tr>
+            <tr>
+              <th>Name</th><th>Email</th><th>Phone</th>
+              <th>Job Title</th><th>Industry</th><th>Joined</th>
+            </tr>
           </thead>
           <tbody>
             {% for m in list %}
             <tr>
-              <td><strong>{{ m.full_name }}</strong></td>
+              <td><strong>{{ m.get('title','') }} {{ m.full_name }} {{ m.get('middle_name','') }}</strong></td>
               <td>{{ m.email }}</td>
               <td>{{ m.phone or '—' }}</td>
+              <td>{{ m.get('job_title','') or '—' }}</td>
+              <td>{{ m.get('industry','') or '—' }}</td>
               <td>{{ m.registered_at[:10] if m.registered_at else '—' }}</td>
             </tr>
             {% endfor %}
