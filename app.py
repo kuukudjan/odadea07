@@ -16,7 +16,7 @@ Other profile fields:
 
 Diagnostics:
   • /health          — basic status
-  • /debug-supabase  — per-table Supabase connectivity check (remove in production later)
+  • /debug-supabase  — per-table Supabase connectivity check
 """
 
 import os
@@ -201,7 +201,6 @@ def sanitize(s, max_len=200):
 
 
 def build_full_name(first, middle, last):
-    """Compose 'First Middle Last' from parts."""
     parts = [str(first or '').strip(),
              str(middle or '').strip(),
              str(last or '').strip()]
@@ -209,7 +208,6 @@ def build_full_name(first, middle, last):
 
 
 def format_dob(day, month, year):
-    """Compose '15 March 1985' from parts."""
     parts = [str(day or '').strip(),
              str(month or '').strip(),
              str(year or '').strip()]
@@ -684,7 +682,7 @@ def reset_password():
 
 
 # ═══════════════════════════════════════════════════════════
-# DASHBOARD
+# DASHBOARD  (profile card redesigned with inline styles)
 # ═══════════════════════════════════════════════════════════
 @app.route('/dashboard')
 @member_required
@@ -755,29 +753,155 @@ def dashboard():
       </div>
     </div>
 
-    <div class="report-section">
-      <h2>📇 My Profile</h2>
-      <div class="table-wrapper">
-        <table class="report-table full-width">
-          <tbody>
-            <tr><th>Title</th><td>{{ m.get('title','') or '—' }}</td></tr>
-            <tr><th>First Name</th><td>{{ m.get('first_name','') or '—' }}</td></tr>
-            <tr><th>Middle Name</th><td>{{ m.get('middle_name','') or '—' }}</td></tr>
-            <tr><th>Last Name</th><td>{{ m.get('last_name','') or '—' }}</td></tr>
-            <tr><th>Date of Birth</th><td>{{ dob }}</td></tr>
-            <tr><th>Email</th><td>{{ m.email }}</td></tr>
-            <tr><th>Phone</th><td>{{ m.get('phone','') or '—' }}</td></tr>
-            <tr><th>House</th><td>{{ m.get('house','') or '—' }}</td></tr>
-            <tr><th>Emergency Contact</th><td>{{ m.get('emergency_contact','') or '—' }}</td></tr>
-            <tr><th>Job Title</th><td>{{ m.get('job_title','') or '—' }}</td></tr>
-            <tr><th>Industry</th><td>{{ m.get('industry','') or '—' }}</td></tr>
-          </tbody>
-        </table>
+    <!-- ══════════════ MY PROFILE (inline styles) ══════════════ -->
+    <div style="background:#ffffff;border-radius:14px;
+                box-shadow:0 2px 8px rgba(26,63,191,0.06),0 8px 24px rgba(26,63,191,0.06);
+                border:1px solid #e3e7ee;overflow:hidden;margin-bottom:2rem;">
+
+      <div style="display:flex;align-items:center;gap:0.75rem;
+                  padding:1.25rem 1.75rem;
+                  background:linear-gradient(135deg,#f6f8ff 0%,#ffffff 100%);
+                  border-bottom:1px solid #e3e7ee;position:relative;">
+        <div style="position:absolute;left:0;top:0;bottom:0;width:4px;
+                    background:linear-gradient(180deg,#1a3fbf 0%,#ed1c24 100%);"></div>
+        <div style="width:40px;height:40px;display:flex;align-items:center;
+                    justify-content:center;background:linear-gradient(135deg,#e7ecff,#f0f4ff);
+                    border-radius:10px;font-size:1.3rem;flex-shrink:0;">📇</div>
+        <div>
+          <h2 style="font-size:1.15rem;font-weight:800;color:#1a3fbf;
+                     margin:0;letter-spacing:-0.2px;">My Profile</h2>
+          <p style="font-size:0.82rem;color:#6c757d;margin:0.15rem 0 0 0;
+                    font-weight:500;">Your membership details on record</p>
+        </div>
       </div>
-      <p style="margin-top:1rem;color:var(--gray-500);font-size:0.9rem;">
-        To update your profile, contact the admin.
-      </p>
+
+      <div style="padding:0.5rem 0;">
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;">
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;border-right:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              👤 Title</div>
+            <div style="font-size:0.98rem;color:{% if m.get('title') %}#1c1f27{% else %}#a3adbf{% endif %};
+                        font-weight:{% if m.get('title') %}500{% else %}400{% endif %};
+                        font-style:{% if not m.get('title') %}italic{% endif %};">
+              {{ m.get('title') or 'Not provided' }}
+            </div>
+          </div>
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              🏠 House</div>
+            <div style="font-size:0.98rem;color:{% if m.get('house') %}#1c1f27{% else %}#a3adbf{% endif %};
+                        font-weight:{% if m.get('house') %}500{% else %}400{% endif %};
+                        font-style:{% if not m.get('house') %}italic{% endif %};">
+              {{ m.get('house') or 'Not provided' }}
+            </div>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;">
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;border-right:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              ✍️ First Name</div>
+            <div style="font-size:1.05rem;font-weight:700;color:#12309a;">
+              {{ m.get('first_name') or '—' }}
+            </div>
+          </div>
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              ✍️ Middle Name</div>
+            <div style="font-size:0.98rem;color:{% if m.get('middle_name') %}#1c1f27{% else %}#a3adbf{% endif %};
+                        font-weight:{% if m.get('middle_name') %}500{% else %}400{% endif %};
+                        font-style:{% if not m.get('middle_name') %}italic{% endif %};">
+              {{ m.get('middle_name') or 'Not provided' }}
+            </div>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;">
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;border-right:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              ✍️ Last Name</div>
+            <div style="font-size:1.05rem;font-weight:700;color:#12309a;">
+              {{ m.get('last_name') or '—' }}
+            </div>
+          </div>
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              🎂 Date of Birth</div>
+            <div style="font-size:0.98rem;
+                        color:{% if dob and dob != '—' %}#c4141a{% else %}#a3adbf{% endif %};
+                        font-weight:{% if dob and dob != '—' %}700{% else %}400{% endif %};
+                        font-style:{% if not (dob and dob != '—') %}italic{% endif %};">
+              {{ dob if dob and dob != '—' else 'Not provided' }}
+            </div>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;">
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;border-right:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              ✉️ Email</div>
+            <div style="font-size:0.98rem;color:#1c1f27;font-weight:500;
+                        word-break:break-word;">
+              {{ m.email }}
+            </div>
+          </div>
+          <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              📞 Phone</div>
+            <div style="font-size:0.98rem;color:{% if m.get('phone') %}#1c1f27{% else %}#a3adbf{% endif %};
+                        font-weight:{% if m.get('phone') %}500{% else %}400{% endif %};
+                        font-style:{% if not m.get('phone') %}italic{% endif %};">
+              {{ m.get('phone') or 'Not provided' }}
+            </div>
+          </div>
+        </div>
+
+        <div style="padding:1rem 1.75rem;border-bottom:1px solid #f1f3f7;">
+          <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                      text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+            🆘 Emergency Contact</div>
+          <div style="font-size:0.98rem;color:{% if m.get('emergency_contact') %}#1c1f27{% else %}#a3adbf{% endif %};
+                      font-weight:{% if m.get('emergency_contact') %}500{% else %}400{% endif %};
+                      font-style:{% if not m.get('emergency_contact') %}italic{% endif %};">
+            {{ m.get('emergency_contact') or 'Not provided' }}
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;">
+          <div style="padding:1rem 1.75rem;border-right:1px solid #f1f3f7;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              💼 Job Title</div>
+            <div style="font-size:0.98rem;color:{% if m.get('job_title') %}#1c1f27{% else %}#a3adbf{% endif %};
+                        font-weight:{% if m.get('job_title') %}500{% else %}400{% endif %};
+                        font-style:{% if not m.get('job_title') %}italic{% endif %};">
+              {{ m.get('job_title') or 'Not provided' }}
+            </div>
+          </div>
+          <div style="padding:1rem 1.75rem;">
+            <div style="font-size:0.72rem;font-weight:800;color:#1a3fbf;
+                        text-transform:uppercase;letter-spacing:1px;margin-bottom:0.35rem;">
+              🏢 Industry</div>
+            <div style="font-size:0.98rem;color:{% if m.get('industry') %}#1c1f27{% else %}#a3adbf{% endif %};
+                        font-weight:{% if m.get('industry') %}500{% else %}400{% endif %};
+                        font-style:{% if not m.get('industry') %}italic{% endif %};">
+              {{ m.get('industry') or 'Not provided' }}
+            </div>
+          </div>
+        </div>
+
+      </div>
     </div>
+    <!-- ══════════════ /MY PROFILE ══════════════ -->
 
     <div class="admin-actions">
       <a href="{{ url_for('polls_page') }}"          class="btn btn-primary">🗳️ Vote in Polls</a>
@@ -1136,21 +1260,14 @@ def health():
 
 
 # ═══════════════════════════════════════════════════════════
-# DEBUG — Supabase per-table check (temporary, remove later)
+# DEBUG — Supabase per-table check
 # ═══════════════════════════════════════════════════════════
 @app.route('/debug-supabase')
 def debug_supabase():
-    """
-    Diagnostic endpoint. For each Supabase table, it tries a
-    single-row read and reports the exact error, if any.
-    Remove this route before going to production long-term.
-    """
     result = {
         'supabase_enabled': sb.SUPABASE_ENABLED,
         'supabase_url_set': bool(os.environ.get('SUPABASE_URL')),
         'supabase_key_set': bool(os.environ.get('SUPABASE_KEY')),
-        'supabase_url_first_chars': (os.environ.get('SUPABASE_URL') or '')[:30],
-        'supabase_key_first_chars': (os.environ.get('SUPABASE_KEY') or '')[:20],
         'client_initialized': False,
         'client_error': None,
         'tables': {}
