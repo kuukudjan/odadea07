@@ -1,0 +1,17 @@
+{
+  "name": "ODADEAƐ07 — PRESEC 2007 Year Group",
+  "short_name": "ODADEAƐ07",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f8ff",
+  "theme_color": "#1a3fbf",
+  "description": "Member platform for the PRESEC 2007 Year Group",
+  "icons": [
+    {
+      "src": "/static/images/presec-badge.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,7 +1,17 @@
 """
-admin_routes.py — ODADEAƐ07 Admin Panel (Supabase-aware)
+admin_routes.py — ODADEAƐ07 Admin Panel (extended)
 
-Poll options: unlimited — admin can add or remove option fields dynamically.
+New features:
+  • Poll scheduling (open_at, close_at, anonymous)
+  • Member roles (member / treasurer / secretary / admin)
+  • Member suspension
+  • Bulk actions (select many, delete)
+  • CSV import for members
+  • Search in members list
+  • Date filters in reports
+  • PDF report downloads
+  • Per-admin accounts
+  • Login history view
 """
 
 import os
@@ -20,12 +30,13 @@ import pandas as pd
 from flask import (Blueprint, render_template_string, request, session,
                    redirect, url_for, flash, send_file, make_response)
 from flask_wtf.csrf import generate_csrf
+from werkzeug.security import generate_password_hash, check_password_hash
 
 import supabase_client as sb
+import two_factor as tf
+from chart_helpers import bar_chart, line_chart, CHART_JS_CDN
+from pdf_helpers import build_pdf
 
-# ─────────────────────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────────────────────
 BASE_DIR            = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR            = os.environ.get('DATA_DIR', os.path.join(BASE_DIR, 'data'))
 MEMBERS_FILE        = os.path.join(DATA_DIR, 'members.csv')
@@ -38,14 +49,11 @@ DUES_CAMPAIGNS_FILE = os.path.join(DATA_DIR, 'dues_campaigns.csv')
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Legacy shared password — still supported for backward compatibility
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'CHANGE-ME-NOW')
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
-
-# ─────────────────────────────────────────────────────────
-# TABLE NAMES
-# ─────────────────────────────────────────────────────────
 T_MEMBERS        = 'members'
 T_POLLS          = 'polls'
 T_VOTES          = 'votes'
@@ -53,18 +61,20 @@ T_CONTRIBUTIONS  = 'contributions'
 T_CAMPAIGNS      = 'contributions_campaigns'
 T_DUES           = 'dues'
 T_DUES_CAMPAIGNS = 'dues_campaigns'
+T_ADMIN_USERS    = 'admin_users'
+T_LOGIN_HISTORY  = 'login_history'
 
 MONTHS = ['January','February','March','April','May','June',
           'July','August','September','October','November','December']
 TITLES = ['Mr','Mrs','Miss','Dr','Rev','Prof','Hon','Nana','Nii']
+ROLES  = ['admin','treasurer','secretary','member']
 
 
 # ─────────────────────────────────────────────────────────
-# RATE LIMITER
+# RATE LIMITER (persistent)
 # ─────────────────────────────────────────────────────────
-_admin_attempts = defaultdict(list)
 _WINDOW = timedelta(minutes=15)
-_MAX = 5
+_MAX    = 5
 
 
 def _client_ip():
@@ -74,18 +84,27 @@ def _client_ip():
     return request.remote_addr or 'unknown'
 
 
-def _locked(ip):
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _rate_locked(prefix, ip):
+    key = f'{prefix}:{ip}'
+    attempts = sb.rate_limit_get(key)
     now = datetime.now()
-    _admin_attempts[ip] = [t for t in _admin_attempts[ip] if now - t < _WINDOW]
-    return len(_admin_attempts[ip]) >= _MAX
+    attempts = [t for t in attempts if _parse_iso(t) and _parse_iso(t) > now - _WINDOW]
+    return len(attempts) >= _MAX, attempts, key
 
 
-def _fail(ip):
-    _admin_attempts[ip].append(datetime.now())
+def _rate_record(key, attempts):
+    sb.rate_limit_set(key, attempts + [datetime.now().isoformat()])
 
 
-def _clear(ip):
-    _admin_attempts.pop(ip, None)
+def _rate_clear(prefix, ip):
+    sb.rate_limit_set(f'{prefix}:{ip}', [])
 
 
 # ─────────────────────────────────────────────────────────
@@ -101,24 +120,24 @@ def _save_csv(path, df):
     df.to_csv(path, index=False)
 
 
-def _load(table_name, csv_path):
+def _load(table, csv_path):
     if sb.SUPABASE_ENABLED:
-        rows = sb.fetch_all(table_name)
+        rows = sb.fetch_all(table)
         if rows:
             return pd.DataFrame(rows).fillna('').astype(str)
         return pd.DataFrame()
     return _load_csv(csv_path)
 
 
-def _insert(table_name, csv_path, row):
+def _insert(table, csv_path, row):
     if sb.SUPABASE_ENABLED:
         client = sb.get_client()
         if client is not None:
             try:
-                client.table(table_name).insert(row).execute()
+                client.table(table).insert(row).execute()
                 return True
             except Exception as e:
-                print(f'[Supabase insert failed for {table_name}]: {e}')
+                print(f'[Supabase insert failed for {table}]: {e}')
     df = _load_csv(csv_path)
     new = pd.DataFrame([row])
     out = pd.concat([df, new], ignore_index=True) if not df.empty else new
@@ -126,12 +145,12 @@ def _insert(table_name, csv_path, row):
     return True
 
 
-def _delete_where(table_name, csv_path, col, val):
+def _delete_where(table, csv_path, col, val):
     if sb.SUPABASE_ENABLED:
         client = sb.get_client()
         if client is not None:
             try:
-                client.table(table_name).delete().eq(col, val).execute()
+                client.table(table).delete().eq(col, val).execute()
                 return True
             except Exception as e:
                 print(f'[Supabase delete failed]: {e}')
@@ -139,20 +158,17 @@ def _delete_where(table_name, csv_path, col, val):
     df = _load_csv(csv_path)
     if df.empty or col not in df.columns:
         return False
-    before = len(df)
     df = df[df[col].astype(str) != str(val)]
-    if len(df) == before:
-        return False
     _save_csv(csv_path, df)
     return True
 
 
-def _update_where(table_name, csv_path, id_col, id_val, updates):
+def _update_where(table, csv_path, id_col, id_val, updates):
     if sb.SUPABASE_ENABLED:
         client = sb.get_client()
         if client is not None:
             try:
-                client.table(table_name).update(updates).eq(id_col, id_val).execute()
+                client.table(table).update(updates).eq(id_col, id_val).execute()
                 return True
             except Exception as e:
                 print(f'[Supabase update failed]: {e}')
@@ -201,10 +217,14 @@ def _csv_response(rows, filename):
     return resp
 
 
+def _is_admin():
+    return bool(session.get('is_admin') or session.get('admin_id'))
+
+
 def _admin_required(f):
     @wraps(f)
     def wrapper(*a, **kw):
-        if not session.get('is_admin'):
+        if not _is_admin():
             flash('Admin login required.', 'warning')
             return redirect(url_for('admin.login'))
         return f(*a, **kw)
@@ -222,6 +242,7 @@ ADMIN_LAYOUT = r"""<!DOCTYPE html>
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Admin — ODADEAƐ07</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {{ chartjs|safe }}
 </head>
 <body>
 <header class="main-header">
@@ -231,16 +252,17 @@ ADMIN_LAYOUT = r"""<!DOCTYPE html>
                  class="school-badge" onerror="this.style.display='none'">
             <div class="logo-text">
                 <h1>ODADEAƐ07 <span style="color:#f5c518;font-size:0.7em;">ADMIN</span></h1>
-                <p>Presbyterian Boys' Secondary School • 2007</p>
+                <p>PRESEC 2007 Year Group</p>
             </div>
         </a>
         <nav class="main-nav">
-            {% if session.is_admin %}
+            {% if session.is_admin or session.admin_id %}
                 <a href="{{ url_for('admin.home') }}">📊 Dashboard</a>
                 <a href="{{ url_for('admin.polls') }}">🗳️ Polls</a>
                 <a href="{{ url_for('admin.contrib') }}">🎯 Contributions</a>
                 <a href="{{ url_for('admin.dues') }}">📅 Dues</a>
                 <a href="{{ url_for('admin.members') }}">👥 Members</a>
+                <a href="{{ url_for('admin.admin_users') }}">🔐 Admins</a>
                 <a href="{{ url_for('admin.reports') }}">📈 Reports</a>
                 <a href="{{ url_for('admin.logout') }}" class="btn-register">Logout</a>
             {% endif %}
@@ -262,11 +284,8 @@ ADMIN_LAYOUT = r"""<!DOCTYPE html>
 
 <footer class="main-footer">
     <div class="footer-content">
-        <p><strong>ODADEAƐ07 Admin Panel</strong> — internal use only</p>
+        <p><strong>ODADEAƐ07 Admin Panel</strong></p>
         <p class="motto">"In Lumine Tuo Videbimus Lumen"</p>
-        <p style="opacity:0.7;font-size:0.8em;">
-          Data source: {{ 'Supabase' if supabase_on else 'Local CSV' }}
-        </p>
     </div>
 </footer>
 </body>
@@ -279,46 +298,114 @@ def _page(body):
         ADMIN_LAYOUT,
         body=body,
         csrf_token=generate_csrf,
-        supabase_on=sb.SUPABASE_ENABLED,
+        chartjs=CHART_JS_CDN,
     )
 
 
 # ─────────────────────────────────────────────────────────
-# LOGIN / LOGOUT
+# LOGIN / LOGOUT (individual + legacy password)
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/login', methods=['GET', 'POST'])
 def login():
     ip = _client_ip()
     if request.method == 'POST':
-        if _locked(ip):
-            flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
+        locked, attempts, key = _rate_locked('admin-login', ip)
+        if locked:
+            flash('Too many attempts. Locked for 15 minutes.', 'danger')
             return redirect(url_for('admin.login'))
 
-        if request.form.get('password') == ADMIN_PASSWORD:
-            _clear(ip)
+        email = _sanitize(request.form.get('email', ''), 120).lower()
+        pwd   = request.form.get('password', '')
+
+        # Try individual admin account first
+        admins = _load(T_ADMIN_USERS, os.path.join(DATA_DIR, 'admin_users.csv'))
+        if email and not admins.empty:
+            row = admins[admins['email'].str.lower() == email]
+            if not row.empty:
+                stored = row.iloc[0].get('password_hash', '')
+                try:
+                    if check_password_hash(stored, pwd):
+                        # Check 2FA
+                        if str(row.iloc[0].get('totp_enabled', 'False')).lower() == 'true':
+                            session['pending_admin_id'] = row.iloc[0]['admin_id']
+                            return redirect(url_for('admin.login_2fa'))
+                        _rate_clear('admin-login', ip)
+                        session['admin_id'] = row.iloc[0]['admin_id']
+                        session['admin_email'] = email
+                        session['is_admin'] = True
+                        session.permanent = True
+                        _update_where(T_ADMIN_USERS,
+                                      os.path.join(DATA_DIR, 'admin_users.csv'),
+                                      'admin_id', row.iloc[0]['admin_id'],
+                                      {'last_login': datetime.now().isoformat()})
+                        sb.log_login('admin', row.iloc[0]['admin_id'], ip,
+                                     request.headers.get('User-Agent', ''), True)
+                        flash(f'Welcome, {row.iloc[0].get("full_name", "admin")}.', 'success')
+                        return redirect(url_for('admin.home'))
+                except Exception:
+                    pass
+
+        # Fall back to legacy shared password
+        if pwd == ADMIN_PASSWORD:
+            _rate_clear('admin-login', ip)
             session['is_admin'] = True
             session.permanent = True
+            sb.log_login('admin', None, ip,
+                         request.headers.get('User-Agent', ''), True)
             flash('Welcome, admin.', 'success')
             return redirect(url_for('admin.home'))
 
-        _fail(ip)
-        remaining = _MAX - len(_admin_attempts[ip])
-        flash(f'Wrong password. {remaining} attempts left.' if remaining > 0
-              else 'Too many failed attempts. Locked for 15 minutes.', 'danger')
+        _rate_record(key, attempts)
+        sb.log_login('admin', None, ip,
+                     request.headers.get('User-Agent', ''), False)
+        remaining = _MAX - (len(attempts) + 1)
+        flash(f'Invalid credentials. {max(remaining, 0)} attempts left.', 'danger')
 
     body = render_template_string("""
     <div class="form-container">
       <h1>🛡️ Admin Login</h1>
-      <p class="form-subtitle">Private access — ODADEAƐ07</p>
+      <p class="form-subtitle">Sign in with your admin email, or use the shared password</p>
       <form method="POST">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <div class="form-group">
-          <label>Admin Password</label>
-          <input type="password" name="password" required autofocus>
-        </div>
+        <div class="form-group"><label>Email (if you have a personal admin account)</label>
+          <input type="email" name="email" autofocus></div>
+        <div class="form-group"><label>Password</label>
+          <input type="password" name="password" required></div>
         <button class="btn btn-primary btn-full">🔓 Enter</button>
       </form>
-      <p class="form-footer"><a href="{{ url_for('index') }}">← Back to site</a></p>
+      <p class="form-footer">
+        <a href="{{ url_for('index') }}">← Back to site</a>
+      </p>
+    </div>
+    """)
+    return _page(body)
+
+
+@admin_bp.route('/login/2fa', methods=['GET', 'POST'])
+def login_2fa():
+    aid = session.get('pending_admin_id')
+    if not aid:
+        return redirect(url_for('admin.login'))
+    if request.method == 'POST':
+        code = _sanitize(request.form.get('code', ''), 6)
+        row = sb.fetch_one(T_ADMIN_USERS, 'admin_id', aid)
+        if row and tf.verify(row.get('totp_secret', ''), code):
+            session.pop('pending_admin_id', None)
+            session['admin_id'] = aid
+            session['is_admin'] = True
+            session.permanent = True
+            flash('Welcome.', 'success')
+            return redirect(url_for('admin.home'))
+        flash('Invalid code.', 'danger')
+    body = render_template_string("""
+    <div class="form-container">
+      <h1>Two-factor</h1>
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group"><label>6-digit code</label>
+          <input name="code" required maxlength="6" inputmode="numeric" autofocus></div>
+        <button class="btn btn-primary btn-full">Verify</button>
+      </form>
     </div>
     """)
     return _page(body)
@@ -327,12 +414,14 @@ def login():
 @admin_bp.route('/logout')
 def logout():
     session.pop('is_admin', None)
-    flash('Admin logged out.', 'info')
+    session.pop('admin_id', None)
+    session.pop('admin_email', None)
+    flash('Logged out.', 'info')
     return redirect(url_for('admin.login'))
 
 
 # ─────────────────────────────────────────────────────────
-# DASHBOARD
+# DASHBOARD (with charts)
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/')
 @_admin_required
@@ -359,10 +448,27 @@ def home():
         'dues_total': _sum(dues),
         'dues_plans': len(duesc),
     }
+
+    # Charts
+    dues_chart = ''
+    if not dues.empty:
+        df = dues.copy()
+        df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+        df['month'] = df['created_at'].str[:7]
+        g = df.groupby('month')['amount'].sum().sort_index()
+        dues_chart = line_chart('dues-monthly',
+                                list(g.index), [float(v) for v in g.values])
+
+    member_status_chart = ''
+    if not members.empty and 'status' in members.columns:
+        counts = members['status'].replace('', 'active').value_counts()
+        member_status_chart = bar_chart('member-status',
+                                        list(counts.index),
+                                        [int(v) for v in counts.values])
+
     body = render_template_string("""
     <div class="reports-header">
-      <div><h1>🛡️ Admin Dashboard</h1>
-      <p class="subtitle">Full control • live data</p></div>
+      <div><h1>🛡️ Admin Dashboard</h1><p class="subtitle">Live data</p></div>
       <div class="report-actions">
         <a href="{{ url_for('admin.reports') }}" class="btn btn-primary">📈 All Reports</a>
         <a href="{{ url_for('admin.logout') }}" class="btn btn-secondary">Logout</a>
@@ -376,7 +482,7 @@ def home():
       <div class="report-stat-card"><div class="stat-icon">🗳️</div>
         <div class="stat-value">{{ s.polls }}</div>
         <div class="stat-title">Polls</div>
-        <div class="stat-sub">{{ s.votes }} votes cast</div></div>
+        <div class="stat-sub">{{ s.votes }} votes</div></div>
       <div class="report-stat-card"><div class="stat-icon">🎯</div>
         <div class="stat-value">{{ s.camps }}</div>
         <div class="stat-title">Campaigns</div></div>
@@ -391,20 +497,36 @@ def home():
         <div class="stat-title">Dues Collected</div></div>
     </div>
 
-    <div class="admin-actions">
-      <a href="{{ url_for('admin.polls') }}"   class="btn btn-primary">🗳️ Manage Polls</a>
-      <a href="{{ url_for('admin.contrib') }}" class="btn btn-primary">🎯 Manage Contributions</a>
-      <a href="{{ url_for('admin.dues') }}"    class="btn btn-primary">📅 Manage Dues</a>
-      <a href="{{ url_for('admin.members') }}" class="btn btn-primary">👥 Manage Members</a>
-      <a href="{{ url_for('admin.reports') }}" class="btn btn-secondary">📈 Reports & Downloads</a>
-      <a href="{{ url_for('admin.backup') }}"  class="btn btn-secondary">💾 Full Backup (ZIP)</a>
+    {% if dues_chart %}
+    <div class="report-section">
+      <h2>📈 Dues collected per month</h2>
+      {{ dues_chart|safe }}
     </div>
-    """, s=stats)
+    {% endif %}
+
+    {% if member_status_chart %}
+    <div class="report-section">
+      <h2>👥 Members by status</h2>
+      {{ member_status_chart|safe }}
+    </div>
+    {% endif %}
+
+    <div class="admin-actions">
+      <a href="{{ url_for('admin.polls') }}"   class="btn btn-primary">🗳️ Polls</a>
+      <a href="{{ url_for('admin.contrib') }}" class="btn btn-primary">🎯 Contributions</a>
+      <a href="{{ url_for('admin.dues') }}"    class="btn btn-primary">📅 Dues</a>
+      <a href="{{ url_for('admin.members') }}" class="btn btn-primary">👥 Members</a>
+      <a href="{{ url_for('admin.admin_users') }}" class="btn btn-secondary">🔐 Admin Users</a>
+      <a href="{{ url_for('admin.login_history') }}" class="btn btn-secondary">🔐 Login History</a>
+      <a href="{{ url_for('admin.reports') }}" class="btn btn-secondary">📈 Reports</a>
+      <a href="{{ url_for('admin.backup') }}"  class="btn btn-secondary">💾 Backup (ZIP)</a>
+    </div>
+    """, s=stats, dues_chart=dues_chart, member_status_chart=member_status_chart)
     return _page(body)
 
 
 # ─────────────────────────────────────────────────────────
-# POLLS — dynamic options (unlimited)
+# POLLS (scheduling + anonymous + unlimited options)
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/polls', methods=['GET', 'POST'])
 @_admin_required
@@ -415,18 +537,17 @@ def polls():
         if action == 'create':
             title = _sanitize(request.form.get('title', ''), 200)
             desc  = _sanitize(request.form.get('description', ''), 400)
-
             try:
                 n = int(request.form.get('option_count', 2))
             except (TypeError, ValueError):
                 n = 2
             n = max(2, min(n, 100))
+            opts = [_sanitize(request.form.get(f'option_{i}', ''), 120) for i in range(n)]
+            opts = [o for o in opts if o]
 
-            opts = []
-            for i in range(n):
-                v = _sanitize(request.form.get(f'option_{i}', ''), 120)
-                if v:
-                    opts.append(v)
+            open_at  = _sanitize(request.form.get('open_at', ''), 30)
+            close_at = _sanitize(request.form.get('close_at', ''), 30)
+            anonymous = 'True' if request.form.get('anonymous') else 'False'
 
             if title and len(opts) >= 2:
                 _insert(T_POLLS, POLLS_FILE, {
@@ -436,18 +557,19 @@ def polls():
                                                 for i, t in enumerate(opts)]),
                     'created_at': datetime.now().isoformat(),
                     'active': 'True',
+                    'open_at': open_at,
+                    'close_at': close_at,
+                    'anonymous': anonymous,
                 })
-                flash(f'✅ Poll created: "{title}" with {len(opts)} options.', 'success')
+                flash(f'✅ Poll created with {len(opts)} options.', 'success')
             else:
-                flash('Need a title and at least 2 non-empty options.', 'danger')
+                flash('Need a title and at least 2 options.', 'danger')
 
         elif action == 'delete':
             pid = request.form.get('poll_id')
             if pid and _delete_where(T_POLLS, POLLS_FILE, 'poll_id', pid):
                 _delete_where(T_VOTES, VOTES_FILE, 'poll_id', pid)
-                flash('Poll and its votes deleted.', 'success')
-            else:
-                flash('Poll not found.', 'danger')
+                flash('Poll deleted.', 'success')
 
         elif action == 'toggle':
             pid = request.form.get('poll_id')
@@ -466,9 +588,18 @@ def polls():
     votes_df = _load(T_VOTES, VOTES_FILE)
     member_count = len(_load(T_MEMBERS, MEMBERS_FILE))
 
+    # Date filter
+    from_date = _sanitize(request.args.get('from', ''), 10)
+    to_date   = _sanitize(request.args.get('to', ''), 10)
+
     reports = []
     if not polls_df.empty:
         for _, p in polls_df.iterrows():
+            created = str(p.get('created_at', ''))[:10]
+            if from_date and created < from_date:
+                continue
+            if to_date and created > to_date:
+                continue
             pid = p['poll_id']
             try:
                 opts = json.loads(p.get('options_json', '[]'))
@@ -477,92 +608,98 @@ def polls():
             pv = votes_df[votes_df['poll_id'] == pid] if not votes_df.empty else pd.DataFrame()
             tally = pv['option_id'].value_counts().to_dict() if not pv.empty else {}
             total = len(pv)
-            results = []
-            for o in opts:
-                c = tally.get(o['id'], 0)
-                results.append({
-                    'text': o['text'], 'votes': c,
-                    'pct': round(c / total * 100, 1) if total else 0,
-                })
+            results = [{'text': o['text'], 'votes': tally.get(o['id'], 0),
+                        'pct': round(tally.get(o['id'], 0) / total * 100, 1) if total else 0}
+                       for o in opts]
             winner = max(results, key=lambda x: x['votes'])['text'] if results and total else None
             reports.append({
                 'id': pid, 'title': p['title'],
                 'description': p.get('description', ''),
                 'active': str(p.get('active', True)).lower() in ['true', '1', 'yes'],
-                'created_at': str(p.get('created_at', ''))[:10],
+                'anonymous': str(p.get('anonymous', 'False')).lower() == 'true',
+                'open_at': p.get('open_at', ''),
+                'close_at': p.get('close_at', ''),
+                'created_at': created,
                 'total': total,
                 'option_count': len(opts),
                 'turnout': round(total / member_count * 100, 1) if member_count else 0,
                 'results': results, 'winner': winner,
-                'voters': pv[['member_name', 'voted_at']].to_dict('records') if not pv.empty else [],
+                'voters': ([] if str(p.get('anonymous', 'False')).lower() == 'true'
+                           else pv[['member_name', 'voted_at']].to_dict('records') if not pv.empty else []),
             })
 
     body = render_template_string("""
     <div class="reports-header">
-      <div><h1>🗳️ Polls</h1><p class="subtitle">{{ reports|length }} poll(s)</p></div>
+      <div><h1>🗳️ Polls</h1><p class="subtitle">{{ reports|length }}</p></div>
       <div class="report-actions">
         <a href="{{ url_for('admin.report', kind='all_polls') }}" class="btn btn-secondary">⬇ All Polls</a>
-        <a href="{{ url_for('admin.report', kind='all_votes') }}" class="btn btn-secondary">⬇ All Votes</a>
+        <a href="{{ url_for('admin.report', kind='all_votes') }}" class="btn btn-secondary">⬇ Votes</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
 
     <div class="form-container">
       <h1>➕ Create a Poll</h1>
-      <p class="form-subtitle">Add as many options as you need</p>
-
       <form method="POST" id="create-poll-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="create">
         <input type="hidden" name="option_count" id="option_count_hidden" value="2">
 
+        <div class="form-group"><label>Title *</label>
+          <input name="title" required maxlength="200"></div>
+        <div class="form-group"><label>Description</label>
+          <textarea name="description" maxlength="400"></textarea></div>
+
+        <div class="form-row">
+          <div class="form-group"><label>Opens at (optional)</label>
+            <input type="datetime-local" name="open_at"></div>
+          <div class="form-group"><label>Closes at (optional)</label>
+            <input type="datetime-local" name="close_at"></div>
+        </div>
         <div class="form-group">
-          <label>Poll Title *</label>
-          <input name="title" required maxlength="200"
-                 placeholder="e.g. Where should we hold the 2026 reunion?">
+          <label><input type="checkbox" name="anonymous" value="1">
+            Anonymous voting (hide voter names)</label>
         </div>
 
         <div class="form-group">
-          <label>Description (optional)</label>
-          <textarea name="description" maxlength="400"
-                    placeholder="Add context for voters"></textarea>
-        </div>
-
-        <div class="form-group">
-          <label>Options * <span style="font-weight:400;color:#6c757d;text-transform:none;letter-spacing:0;">(minimum 2)</span></label>
-
+          <label>Options * (minimum 2)</label>
           <div id="options-wrapper">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;" class="option-row">
-              <span style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;background:#e7ecff;color:#1a3fbf;border-radius:50%;font-size:13px;font-weight:800;flex-shrink:0;" class="option-num">1</span>
+            <div style="display:flex;gap:8px;margin-bottom:8px;" class="option-row">
               <input type="text" name="option_0" required maxlength="120"
-                     placeholder="Option 1" style="flex:1;padding:12px 16px;border:2px solid #e3e7ee;border-radius:10px;font-size:15px;background:#f6f8ff;box-sizing:border-box;">
+                     placeholder="Option 1" style="flex:1;padding:12px;border:2px solid #e3e7ee;border-radius:10px;">
               <button type="button" class="option-remove-btn" disabled
-                      style="width:36px;height:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;font-size:16px;font-weight:800;opacity:0.35;flex-shrink:0;">✕</button>
+                      style="width:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;opacity:0.35;">✕</button>
             </div>
-
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;" class="option-row">
-              <span style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;background:#e7ecff;color:#1a3fbf;border-radius:50%;font-size:13px;font-weight:800;flex-shrink:0;" class="option-num">2</span>
+            <div style="display:flex;gap:8px;margin-bottom:8px;" class="option-row">
               <input type="text" name="option_1" required maxlength="120"
-                     placeholder="Option 2" style="flex:1;padding:12px 16px;border:2px solid #e3e7ee;border-radius:10px;font-size:15px;background:#f6f8ff;box-sizing:border-box;">
+                     placeholder="Option 2" style="flex:1;padding:12px;border:2px solid #e3e7ee;border-radius:10px;">
               <button type="button" class="option-remove-btn" disabled
-                      style="width:36px;height:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;font-size:16px;font-weight:800;opacity:0.35;flex-shrink:0;">✕</button>
+                      style="width:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;opacity:0.35;">✕</button>
             </div>
           </div>
-
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:12px;border-top:1px dashed #e3e7ee;">
+          <div style="display:flex;justify-content:space-between;margin-top:12px;padding-top:12px;border-top:1px dashed #e3e7ee;">
             <button type="button" id="add-option-btn"
-                    style="padding:9px 18px;border-radius:10px;border:2px solid #1a3fbf;background:#ffffff;color:#1a3fbf;font-weight:700;cursor:pointer;font-size:14px;">
+                    style="padding:9px 18px;border-radius:10px;border:2px solid #1a3fbf;background:#fff;color:#1a3fbf;font-weight:700;cursor:pointer;">
               ➕ Add another option
             </button>
-            <span style="font-size:13px;color:#6c757d;font-weight:600;">
-              <span id="option-counter">2</span> options
-            </span>
+            <span><span id="option-counter">2</span> options</span>
           </div>
         </div>
 
-        <button type="submit" class="btn btn-primary btn-full" style="margin-top:1.5rem;">
-          ✅ Create Poll
-        </button>
+        <button class="btn btn-primary btn-full" style="margin-top:1.5rem;">✅ Create Poll</button>
+      </form>
+    </div>
+
+    <div class="form-container" style="max-width:640px;">
+      <h3>Filter by creation date</h3>
+      <form method="GET">
+        <div class="form-row">
+          <div class="form-group"><label>From</label>
+            <input type="date" name="from" value="{{ from_date }}"></div>
+          <div class="form-group"><label>To</label>
+            <input type="date" name="to" value="{{ to_date }}"></div>
+        </div>
+        <button class="btn btn-primary">Apply Filter</button>
       </form>
     </div>
 
@@ -572,17 +709,20 @@ def polls():
         <div>
           <h2>{{ p.title }}
             <span class="status-badge status-{{ 'active' if p.active else 'closed' }}">
-              {{ 'Active' if p.active else 'Closed' }}</span></h2>
+              {{ 'Active' if p.active else 'Closed' }}</span>
+            {% if p.anonymous %}<span class="status-badge" style="background:#e7ecff;color:#1a3fbf;">Anonymous</span>{% endif %}
+          </h2>
           <p>{{ p.description }}</p>
           <p class="poll-meta">
-            Created {{ p.created_at }} • ID <code>{{ p.id }}</code> •
-            {{ p.option_count }} option{{ 's' if p.option_count != 1 else '' }}
+            Created {{ p.created_at }} • {{ p.option_count }} options
+            {% if p.open_at %}• Opens {{ p.open_at[:16] }}{% endif %}
+            {% if p.close_at %}• Closes {{ p.close_at[:16] }}{% endif %}
           </p>
         </div>
         <div class="poll-totals">
           <div class="poll-total-value">{{ p.total }}</div>
           <div class="poll-total-label">Votes</div>
-          <div class="poll-turnout">{{ p.turnout }}% turnout</div>
+          <div class="poll-turnout">{{ p.turnout }}%</div>
         </div>
       </div>
 
@@ -598,35 +738,16 @@ def polls():
       </div>
       {% endfor %}
 
-      {% if p.voters %}
-      <details class="voters-details">
-        <summary>View {{ p.voters|length }} voter(s)</summary>
-        <div class="table-wrapper" style="margin-top:1rem;">
-          <table class="report-table">
-            <thead><tr><th>Member</th><th>Voted At</th></tr></thead>
-            <tbody>
-              {% for v in p.voters %}
-              <tr><td>{{ v.member_name }}</td><td>{{ v.voted_at[:19] }}</td></tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </details>
-      {% endif %}
-
-      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:1rem;padding-top:1rem;border-top:1px dashed var(--gray-200);">
-        <a href="{{ url_for('admin.report', kind='poll', poll_id=p.id) }}" class="btn btn-small btn-primary">⬇ Poll Report</a>
-        <a href="{{ url_for('admin.report', kind='poll_votes', poll_id=p.id) }}" class="btn btn-small btn-secondary">⬇ Votes</a>
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:1rem;padding-top:1rem;border-top:1px dashed #e3e7ee;">
+        <a href="{{ url_for('admin.report', kind='poll', poll_id=p.id) }}" class="btn btn-small btn-primary">⬇ Report CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='poll', poll_id=p.id) }}" class="btn btn-small btn-secondary">⬇ Report PDF</a>
         <form method="POST" style="display:inline;">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="toggle">
           <input type="hidden" name="poll_id" value="{{ p.id }}">
-          <button class="btn btn-small btn-secondary">
-            {{ '🔒 Close' if p.active else '🔓 Re-open' }}
-          </button>
+          <button class="btn btn-small btn-secondary">{{ '🔒 Close' if p.active else '🔓 Re-open' }}</button>
         </form>
-        <form method="POST" style="display:inline;"
-              onsubmit="return confirm('Delete this poll and all votes?');">
+        <form method="POST" style="display:inline;" onsubmit="return confirm('Delete this poll?');">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="poll_id" value="{{ p.id }}">
@@ -635,105 +756,52 @@ def polls():
       </div>
     </div>
     {% else %}
-    <p class="empty-state">No polls yet. Create one above.</p>
+    <p class="empty-state">No polls.</p>
     {% endfor %}
 
     <script>
-      (function () {
-        var MIN_OPTIONS = 2;
-        var MAX_OPTIONS = 100;
-        var wrapper = document.getElementById('options-wrapper');
-        var addBtn = document.getElementById('add-option-btn');
-        var countHidden = document.getElementById('option_count_hidden');
-        var counter = document.getElementById('option-counter');
-
-        function refresh() {
-          var rows = wrapper.querySelectorAll('.option-row');
-          for (var i = 0; i < rows.length; i++) {
-            var row = rows[i];
-            var num = row.querySelector('.option-num');
-            var inp = row.querySelector('input[type="text"]');
-            var rm  = row.querySelector('.option-remove-btn');
-            if (num) num.textContent = (i + 1);
-            if (inp) {
-              inp.name = 'option_' + i;
-              inp.placeholder = 'Option ' + (i + 1);
-            }
-            if (rm) {
-              if (rows.length <= MIN_OPTIONS) {
-                rm.disabled = true;
-                rm.style.cursor = 'not-allowed';
-                rm.style.opacity = '0.35';
-              } else {
-                rm.disabled = false;
-                rm.style.cursor = 'pointer';
-                rm.style.opacity = '1';
-              }
-            }
+      (function(){
+        var MIN=2, MAX=100;
+        var w = document.getElementById('options-wrapper');
+        var add = document.getElementById('add-option-btn');
+        var cnt = document.getElementById('option_counter');
+        var hidden = document.getElementById('option_count_hidden');
+        function refresh(){
+          var rows = w.querySelectorAll('.option-row');
+          for (var i=0;i<rows.length;i++){
+            var inp = rows[i].querySelector('input[type="text"]');
+            var rm = rows[i].querySelector('.option-remove-btn');
+            inp.name='option_'+i; inp.placeholder='Option '+(i+1);
+            if (rm) { rm.disabled = rows.length<=MIN; rm.style.opacity = rm.disabled ? 0.35 : 1; rm.style.cursor = rm.disabled ? 'not-allowed' : 'pointer'; }
           }
-          countHidden.value = rows.length;
-          counter.textContent = rows.length;
-          addBtn.disabled = (rows.length >= MAX_OPTIONS);
-          if (addBtn.disabled) {
-            addBtn.textContent = 'Maximum reached';
-          } else {
-            addBtn.textContent = '➕ Add another option';
-          }
+          cnt.textContent = rows.length;
+          hidden.value = rows.length;
+          add.disabled = rows.length>=MAX;
         }
-
-        function addOption() {
-          var rows = wrapper.querySelectorAll('.option-row');
-          if (rows.length >= MAX_OPTIONS) return;
+        add.addEventListener('click', function(){
+          var rows = w.querySelectorAll('.option-row');
+          if (rows.length>=MAX) return;
           var i = rows.length;
-
           var row = document.createElement('div');
-          row.className = 'option-row';
-          row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;';
-
-          var num = document.createElement('span');
-          num.className = 'option-num';
-          num.textContent = (i + 1);
-          num.style.cssText = 'width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;background:#e7ecff;color:#1a3fbf;border-radius:50%;font-size:13px;font-weight:800;flex-shrink:0;';
-          row.appendChild(num);
-
-          var inp = document.createElement('input');
-          inp.type = 'text';
-          inp.name = 'option_' + i;
-          inp.maxLength = 120;
-          inp.placeholder = 'Option ' + (i + 1);
-          inp.style.cssText = 'flex:1;padding:12px 16px;border:2px solid #e3e7ee;border-radius:10px;font-size:15px;background:#f6f8ff;box-sizing:border-box;';
-          row.appendChild(inp);
-
-          var rm = document.createElement('button');
-          rm.type = 'button';
-          rm.className = 'option-remove-btn';
-          rm.textContent = '✕';
-          rm.title = 'Remove this option';
-          rm.style.cssText = 'width:36px;height:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:pointer;font-size:16px;font-weight:800;flex-shrink:0;';
-          row.appendChild(rm);
-
-          wrapper.appendChild(row);
-          refresh();
-          inp.focus();
-        }
-
-        wrapper.addEventListener('click', function (e) {
-          var t = e.target;
-          if (!t.classList || !t.classList.contains('option-remove-btn')) return;
-          var rows = wrapper.querySelectorAll('.option-row');
-          if (rows.length <= MIN_OPTIONS) return;
-          var row = t.parentNode;
-          if (!row) return;
-          row.parentNode.removeChild(row);
+          row.className='option-row';
+          row.style.cssText='display:flex;gap:8px;margin-bottom:8px;';
+          row.innerHTML = '<input type="text" name="option_'+i+'" maxlength="120" placeholder="Option '+(i+1)+'" style="flex:1;padding:12px;border:2px solid #e3e7ee;border-radius:10px;">'+
+            '<button type="button" class="option-remove-btn" style="width:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:pointer;">✕</button>';
+          w.appendChild(row);
           refresh();
         });
-
-        addBtn.addEventListener('click', addOption);
-
+        w.addEventListener('click', function(e){
+          var t = e.target;
+          if (!t.classList || !t.classList.contains('option-remove-btn')) return;
+          var rows = w.querySelectorAll('.option-row');
+          if (rows.length<=MIN) return;
+          t.parentNode.remove();
+          refresh();
+        });
         refresh();
       })();
     </script>
-    """, reports=reports)
+    """, reports=reports, from_date=from_date, to_date=to_date)
     return _page(body)
 
 
@@ -745,7 +813,6 @@ def polls():
 def contrib():
     if request.method == 'POST':
         action = request.form.get('action', 'create')
-
         if action == 'create':
             title = _sanitize(request.form.get('title', ''), 200)
             desc  = _sanitize(request.form.get('description', ''), 400)
@@ -761,18 +828,12 @@ def contrib():
                     'created_at': datetime.now().isoformat(),
                     'active': 'True',
                 })
-                flash(f'✅ Campaign created: "{title}"', 'success')
-            else:
-                flash('Title and target amount required.', 'danger')
-
+                flash(f'Campaign created: "{title}"', 'success')
         elif action == 'delete':
             cid = request.form.get('campaign_id')
             if cid and _delete_where(T_CAMPAIGNS, CAMPAIGNS_FILE, 'campaign_id', cid):
                 _delete_where(T_CONTRIBUTIONS, CONTRIBUTIONS_FILE, 'campaign_id', cid)
-                flash('Campaign and its payments deleted.', 'success')
-            else:
-                flash('Campaign not found.', 'danger')
-
+                flash('Campaign deleted.', 'success')
         elif action == 'toggle':
             cid = request.form.get('campaign_id')
             df = _load(T_CAMPAIGNS, CAMPAIGNS_FILE)
@@ -782,8 +843,6 @@ def contrib():
                     cur = str(row.iloc[0]['active']).lower() in ['true', '1', 'yes']
                     _update_where(T_CAMPAIGNS, CAMPAIGNS_FILE, 'campaign_id', cid,
                                   {'active': str(not cur)})
-                    flash(f'Campaign {"closed" if cur else "re-opened"}.', 'success')
-
         return redirect(url_for('admin.contrib'))
 
     camps = _load(T_CAMPAIGNS, CAMPAIGNS_FILE)
@@ -806,18 +865,15 @@ def contrib():
                 'pct': min(pct, 100), 'raw_pct': round(pct, 1),
                 'paid': len(paid_ids),
                 'unpaid': member_count - len(paid_ids),
-                'members': member_count,
                 'active': str(c.get('active', True)).lower() in ['true', '1', 'yes'],
-                'payments': sub.to_dict('records') if not sub.empty else [],
             })
 
     body = render_template_string("""
     <div class="reports-header">
-      <div><h1>🎯 Contribution Campaigns</h1>
-      <p class="subtitle">{{ reports|length }} campaign(s)</p></div>
+      <div><h1>🎯 Campaigns</h1><p class="subtitle">{{ reports|length }}</p></div>
       <div class="report-actions">
-        <a href="{{ url_for('admin.report', kind='all_campaigns') }}" class="btn btn-secondary">⬇ All Campaigns</a>
-        <a href="{{ url_for('admin.report', kind='all_contributions') }}" class="btn btn-secondary">⬇ All Contributions</a>
+        <a href="{{ url_for('admin.report', kind='all_campaigns') }}" class="btn btn-secondary">⬇ CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='all_campaigns') }}" class="btn btn-secondary">⬇ PDF</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
@@ -829,70 +885,38 @@ def contrib():
         <input type="hidden" name="action" value="create">
         <div class="form-group"><label>Title *</label>
           <input name="title" required maxlength="200"></div>
-        <div class="form-group"><label>Description (optional)</label>
+        <div class="form-group"><label>Description</label>
           <textarea name="description" maxlength="400"></textarea></div>
-        <div class="form-group"><label>Target amount (GH₵) *</label>
+        <div class="form-group"><label>Target (GH₵) *</label>
           <input type="number" step="0.01" name="target_amount" required></div>
-        <button class="btn btn-primary btn-full">Create Campaign</button>
+        <button class="btn btn-primary btn-full">Create</button>
       </form>
     </div>
 
     {% for c in reports %}
     <div class="poll-report-card">
       <div class="poll-report-header">
-        <div>
-          <h2>{{ c.title }}
-            <span class="status-badge status-{{ 'active' if c.active else 'closed' }}">
-              {{ 'Active' if c.active else 'Closed' }}</span></h2>
-          <p>{{ c.description }}</p>
-        </div>
+        <div><h2>{{ c.title }}</h2><p>{{ c.description }}</p></div>
         <div class="poll-totals">
           <div class="poll-total-value">GH₵{{ "%.2f"|format(c.raised) }}</div>
           <div class="poll-total-label">of GH₵{{ "%.2f"|format(c.target) }}</div>
-          <div class="poll-turnout">{{ c.raw_pct }}% funded</div>
+          <div class="poll-turnout">{{ c.raw_pct }}%</div>
         </div>
       </div>
       <div class="progress-track">
-        <div class="progress-fill {% if c.pct >= 100 %}full{% endif %}" style="width: {{ c.pct }}%"></div>
+        <div class="progress-fill {% if c.pct >= 100 %}full{% endif %}"
+             style="width: {{ c.pct }}%"></div>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin:1rem 0;">
-        <div><strong>{{ c.paid }}</strong> paid</div>
-        <div><strong>{{ c.unpaid }}</strong> unpaid</div>
-        <div><strong>{{ c.members }}</strong> members</div>
-        <div><strong>GH₵{{ "%.2f"|format(c.target - c.raised if c.raised < c.target else 0) }}</strong> remaining</div>
-      </div>
-
-      {% if c.payments %}
-      <details class="voters-details">
-        <summary>View {{ c.payments|length }} payment(s)</summary>
-        <div class="table-wrapper" style="margin-top:1rem;">
-          <table class="report-table">
-            <thead><tr><th>Date</th><th>Member</th><th>Amount</th><th>Method</th></tr></thead>
-            <tbody>
-              {% for p in c.payments %}
-              <tr><td>{{ p.created_at[:10] }}</td><td>{{ p.member_name }}</td>
-                  <td class="amount">GH₵{{ "%.2f"|format(p.amount|float) }}</td>
-                  <td>{{ p.method }}</td></tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </details>
-      {% endif %}
-
-      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:1rem;padding-top:1rem;border-top:1px dashed var(--gray-200);">
-        <a href="{{ url_for('admin.report', kind='campaign', campaign_id=c.id) }}" class="btn btn-small btn-primary">⬇ Campaign Report</a>
-        <a href="{{ url_for('admin.report', kind='campaign_payments', campaign_id=c.id) }}" class="btn btn-small btn-secondary">⬇ Payments</a>
+      <div class="admin-actions" style="margin-top:1rem;">
+        <a href="{{ url_for('admin.report', kind='campaign', campaign_id=c.id) }}" class="btn btn-small btn-primary">⬇ CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='campaign', campaign_id=c.id) }}" class="btn btn-small btn-secondary">⬇ PDF</a>
         <form method="POST" style="display:inline;">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="toggle">
           <input type="hidden" name="campaign_id" value="{{ c.id }}">
-          <button class="btn btn-small btn-secondary">
-            {{ '🔒 Close' if c.active else '🔓 Re-open' }}
-          </button>
+          <button class="btn btn-small btn-secondary">{{ '🔒 Close' if c.active else '🔓 Re-open' }}</button>
         </form>
-        <form method="POST" style="display:inline;"
-              onsubmit="return confirm('Delete this campaign and all payments?');">
+        <form method="POST" style="display:inline;" onsubmit="return confirm('Delete?');">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="campaign_id" value="{{ c.id }}">
@@ -900,8 +924,6 @@ def contrib():
         </form>
       </div>
     </div>
-    {% else %}
-    <p class="empty-state">No campaigns yet. Create one above.</p>
     {% endfor %}
     """, reports=reports)
     return _page(body)
@@ -915,7 +937,6 @@ def contrib():
 def dues():
     if request.method == 'POST':
         action = request.form.get('action', 'create')
-
         if action == 'create':
             month = _sanitize(request.form.get('month', ''), 30)
             year  = _sanitize(request.form.get('year', ''), 10)
@@ -930,18 +951,12 @@ def dues():
                     'created_at': datetime.now().isoformat(),
                     'active': 'True',
                 })
-                flash(f'✅ Dues created: {month} {year} — GH₵{amount:.2f}', 'success')
-            else:
-                flash('Month, year and amount required.', 'danger')
-
+                flash(f'Dues created: {month} {year} — GH₵{amount:.2f}', 'success')
         elif action == 'delete':
             did = request.form.get('dues_id')
             if did and _delete_where(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE, 'dues_id', did):
                 _delete_where(T_DUES, DUES_FILE, 'dues_id', did)
-                flash('Dues period and payments deleted.', 'success')
-            else:
-                flash('Dues period not found.', 'danger')
-
+                flash('Dues deleted.', 'success')
         elif action == 'toggle':
             did = request.form.get('dues_id')
             df = _load(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE)
@@ -951,8 +966,6 @@ def dues():
                     cur = str(row.iloc[0]['active']).lower() in ['true', '1', 'yes']
                     _update_where(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE, 'dues_id', did,
                                   {'active': str(not cur)})
-                    flash(f'Dues {"closed" if cur else "re-opened"}.', 'success')
-
         return redirect(url_for('admin.dues'))
 
     plans = _load(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE)
@@ -974,18 +987,15 @@ def dues():
                 'amount': amount, 'collected': collected, 'expected': expected,
                 'pct': min(pct, 100), 'raw_pct': round(pct, 1),
                 'paid': len(paid_ids), 'unpaid': member_count - len(paid_ids),
-                'members': member_count,
                 'active': str(d.get('active', True)).lower() in ['true', '1', 'yes'],
-                'payments': sub.to_dict('records') if not sub.empty else [],
             })
 
     body = render_template_string("""
     <div class="reports-header">
-      <div><h1>📅 Monthly Dues</h1><p class="subtitle">{{ reports|length }} period(s)</p></div>
+      <div><h1>📅 Dues</h1><p class="subtitle">{{ reports|length }}</p></div>
       <div class="report-actions">
-        <a href="{{ url_for('admin.report', kind='all_dues_plans') }}" class="btn btn-secondary">⬇ All Plans</a>
-        <a href="{{ url_for('admin.report', kind='all_dues') }}" class="btn btn-secondary">⬇ All Payments</a>
-        <a href="{{ url_for('admin.report', kind='outstanding_dues') }}" class="btn btn-secondary">⬇ Outstanding</a>
+        <a href="{{ url_for('admin.report', kind='all_dues_plans') }}" class="btn btn-secondary">⬇ CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='all_dues_plans') }}" class="btn btn-secondary">⬇ PDF</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
@@ -1002,70 +1012,41 @@ def dues():
               {% for m in months %}<option>{{ m }}</option>{% endfor %}
             </select></div>
           <div class="form-group"><label>Year *</label>
-            <input name="year" required placeholder="2026" maxlength="10"></div>
+            <input name="year" required placeholder="2026"></div>
         </div>
-        <div class="form-group"><label>Amount per member (GH₵) *</label>
+        <div class="form-group"><label>Amount per member *</label>
           <input type="number" step="0.01" name="amount" required></div>
-        <button class="btn btn-primary btn-full">Create Dues</button>
+        <button class="btn btn-primary btn-full">Create</button>
       </form>
     </div>
 
     {% for d in reports %}
     <div class="poll-report-card">
       <div class="poll-report-header">
-        <div>
-          <h2>{{ d.month }} {{ d.year }}
-            <span class="status-badge status-{{ 'active' if d.active else 'closed' }}">
-              {{ 'Open' if d.active else 'Closed' }}</span></h2>
-          <p>GH₵{{ "%.2f"|format(d.amount) }} per member</p>
-        </div>
+        <div><h2>{{ d.month }} {{ d.year }}
+          <span class="status-badge status-{{ 'active' if d.active else 'closed' }}">
+            {{ 'Open' if d.active else 'Closed' }}</span></h2>
+          <p>GH₵{{ "%.2f"|format(d.amount) }} per member</p></div>
         <div class="poll-totals">
           <div class="poll-total-value">GH₵{{ "%.2f"|format(d.collected) }}</div>
           <div class="poll-total-label">of GH₵{{ "%.2f"|format(d.expected) }}</div>
-          <div class="poll-turnout">{{ d.raw_pct }}% collected</div>
+          <div class="poll-turnout">{{ d.raw_pct }}%</div>
         </div>
       </div>
       <div class="progress-track">
-        <div class="progress-fill {% if d.pct >= 100 %}full{% endif %}" style="width: {{ d.pct }}%"></div>
+        <div class="progress-fill {% if d.pct >= 100 %}full{% endif %}"
+             style="width: {{ d.pct }}%"></div>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin:1rem 0;">
-        <div><strong>{{ d.paid }}</strong> paid</div>
-        <div><strong>{{ d.unpaid }}</strong> unpaid</div>
-        <div><strong>{{ d.members }}</strong> members</div>
-        <div><strong>GH₵{{ "%.2f"|format(d.expected - d.collected if d.collected < d.expected else 0) }}</strong> remaining</div>
-      </div>
-
-      {% if d.payments %}
-      <details class="voters-details">
-        <summary>View {{ d.payments|length }} payment(s)</summary>
-        <div class="table-wrapper" style="margin-top:1rem;">
-          <table class="report-table">
-            <thead><tr><th>Date</th><th>Member</th><th>Amount</th><th>Method</th></tr></thead>
-            <tbody>
-              {% for p in d.payments %}
-              <tr><td>{{ p.created_at[:10] }}</td><td>{{ p.member_name }}</td>
-                  <td class="amount">GH₵{{ "%.2f"|format(p.amount|float) }}</td>
-                  <td>{{ p.method }}</td></tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </details>
-      {% endif %}
-
-      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:1rem;padding-top:1rem;border-top:1px dashed var(--gray-200);">
-        <a href="{{ url_for('admin.report', kind='dues_plan', dues_id=d.id) }}" class="btn btn-small btn-primary">⬇ Plan Report</a>
-        <a href="{{ url_for('admin.report', kind='dues_month', month=d.month, year=d.year) }}" class="btn btn-small btn-secondary">⬇ Month Report</a>
+      <div class="admin-actions" style="margin-top:1rem;">
+        <a href="{{ url_for('admin.report', kind='dues_plan', dues_id=d.id) }}" class="btn btn-small btn-primary">⬇ CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='dues_plan', dues_id=d.id) }}" class="btn btn-small btn-secondary">⬇ PDF</a>
         <form method="POST" style="display:inline;">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="toggle">
           <input type="hidden" name="dues_id" value="{{ d.id }}">
-          <button class="btn btn-small btn-secondary">
-            {{ '🔒 Close' if d.active else '🔓 Re-open' }}
-          </button>
+          <button class="btn btn-small btn-secondary">{{ '🔒 Close' if d.active else '🔓 Re-open' }}</button>
         </form>
-        <form method="POST" style="display:inline;"
-              onsubmit="return confirm('Delete this dues period and all payments?');">
+        <form method="POST" style="display:inline;" onsubmit="return confirm('Delete?');">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="dues_id" value="{{ d.id }}">
@@ -1073,15 +1054,13 @@ def dues():
         </form>
       </div>
     </div>
-    {% else %}
-    <p class="empty-state">No dues periods yet. Create one above.</p>
     {% endfor %}
     """, reports=reports, months=MONTHS)
     return _page(body)
 
 
 # ─────────────────────────────────────────────────────────
-# MEMBERS
+# MEMBERS (with search, bulk actions, roles, suspension, CSV import)
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/members', methods=['GET', 'POST'])
 @_admin_required
@@ -1090,45 +1069,37 @@ def members():
         action = request.form.get('action', 'add')
 
         if action == 'add':
-            first_name        = _sanitize(request.form.get('first_name', ''), 120)
-            middle_name       = _sanitize(request.form.get('middle_name', ''), 120)
-            last_name         = _sanitize(request.form.get('last_name', ''), 120)
-            email             = _sanitize(request.form.get('email', ''), 120).lower()
-            title             = _sanitize(request.form.get('title', ''), 20)
-            phone             = _sanitize(request.form.get('phone', ''), 40)
-            dob_day           = _sanitize(request.form.get('dob_day', ''), 2)
-            dob_month         = _sanitize(request.form.get('dob_month', ''), 20)
-            dob_year          = _sanitize(request.form.get('dob_year', ''), 4)
-            house             = _sanitize(request.form.get('house', ''), 60)
-            emergency_contact = _sanitize(request.form.get('emergency_contact', ''), 200)
-            job_title         = _sanitize(request.form.get('job_title', ''), 120)
-            industry          = _sanitize(request.form.get('industry', ''), 120)
-
+            first_name  = _sanitize(request.form.get('first_name', ''), 120)
+            middle_name = _sanitize(request.form.get('middle_name', ''), 120)
+            last_name   = _sanitize(request.form.get('last_name', ''), 120)
+            email       = _sanitize(request.form.get('email', ''), 120).lower()
             if first_name and last_name and email:
                 from werkzeug.security import generate_password_hash
                 full_name = _build_full_name(first_name, middle_name, last_name)
                 _insert(T_MEMBERS, MEMBERS_FILE, {
                     'member_id':         f"MEM{int(time.time())}{random.randint(100,999)}",
-                    'title':             title,
+                    'title':             _sanitize(request.form.get('title', ''), 20),
                     'first_name':        first_name,
                     'middle_name':       middle_name,
                     'last_name':         last_name,
                     'full_name':         full_name,
-                    'dob_day':           dob_day,
-                    'dob_month':         dob_month,
-                    'dob_year':          dob_year,
+                    'dob_day':           _sanitize(request.form.get('dob_day', ''), 2),
+                    'dob_month':         _sanitize(request.form.get('dob_month', ''), 20),
+                    'dob_year':          _sanitize(request.form.get('dob_year', ''), 4),
                     'email':             email,
-                    'phone':             phone,
-                    'house':             house,
-                    'emergency_contact': emergency_contact,
-                    'job_title':         job_title,
-                    'industry':          industry,
+                    'phone':             _sanitize(request.form.get('phone', ''), 40),
+                    'house':             _sanitize(request.form.get('house', ''), 60),
+                    'emergency_contact': _sanitize(request.form.get('emergency_contact', ''), 200),
+                    'job_title':         _sanitize(request.form.get('job_title', ''), 120),
+                    'industry':          _sanitize(request.form.get('industry', ''), 120),
                     'password_hash':     generate_password_hash('changeme123'),
                     'registered_at':     datetime.now().isoformat(),
+                    'status':            'active',
+                    'role':              'member',
+                    'totp_secret':       '',
+                    'totp_enabled':      'False',
                 })
-                flash(f'✅ Member added: {full_name} (default password: changeme123)', 'success')
-            else:
-                flash('First name, last name and email required.', 'danger')
+                flash(f'Member added: {full_name}', 'success')
 
         elif action == 'edit':
             mid = request.form.get('member_id')
@@ -1150,189 +1121,386 @@ def members():
                 'emergency_contact': _sanitize(request.form.get('emergency_contact', ''), 200),
                 'job_title':         _sanitize(request.form.get('job_title', ''), 120),
                 'industry':          _sanitize(request.form.get('industry', ''), 120),
+                'status':            _sanitize(request.form.get('status', 'active'), 20),
+                'role':              _sanitize(request.form.get('role', 'member'), 20),
             }
             if mid and _update_where(T_MEMBERS, MEMBERS_FILE, 'member_id', mid, updates):
                 flash('Member updated.', 'success')
-            else:
-                flash('Member not found.', 'danger')
 
         elif action == 'delete':
             mid = request.form.get('member_id')
             if mid and _delete_where(T_MEMBERS, MEMBERS_FILE, 'member_id', mid):
                 flash('Member deleted.', 'success')
-            else:
-                flash('Member not found.', 'danger')
+
+        elif action == 'bulk_delete':
+            ids = request.form.getlist('member_ids')
+            count = 0
+            for mid in ids:
+                if _delete_where(T_MEMBERS, MEMBERS_FILE, 'member_id', mid):
+                    count += 1
+            flash(f'{count} member(s) deleted.', 'success')
+
+        elif action == 'import':
+            f = request.files.get('csv_file')
+            if not f or not f.filename:
+                flash('Please choose a CSV file.', 'danger')
+                return redirect(url_for('admin.members'))
+            try:
+                df = pd.read_csv(f, dtype=str).fillna('')
+                added = 0
+                from werkzeug.security import generate_password_hash
+                for _, row in df.iterrows():
+                    email = str(row.get('email', '')).strip().lower()
+                    if not email or '@' not in email:
+                        continue
+                    existing = _load(T_MEMBERS, MEMBERS_FILE)
+                    if not existing.empty and email in existing['email'].str.lower().values:
+                        continue
+                    fn = str(row.get('first_name', '')).strip()
+                    ln = str(row.get('last_name', '')).strip()
+                    mn = str(row.get('middle_name', '')).strip()
+                    if not (fn and ln):
+                        continue
+                    _insert(T_MEMBERS, MEMBERS_FILE, {
+                        'member_id':         f"MEM{int(time.time())}{random.randint(100,999)}",
+                        'title':             str(row.get('title', '')).strip(),
+                        'first_name':        fn,
+                        'middle_name':       mn,
+                        'last_name':         ln,
+                        'full_name':         _build_full_name(fn, mn, ln),
+                        'dob_day':           str(row.get('dob_day', '')).strip(),
+                        'dob_month':         str(row.get('dob_month', '')).strip(),
+                        'dob_year':          str(row.get('dob_year', '')).strip(),
+                        'email':             email,
+                        'phone':             str(row.get('phone', '')).strip(),
+                        'house':             str(row.get('house', '')).strip(),
+                        'emergency_contact': str(row.get('emergency_contact', '')).strip(),
+                        'job_title':         str(row.get('job_title', '')).strip(),
+                        'industry':          str(row.get('industry', '')).strip(),
+                        'password_hash':     generate_password_hash(
+                            str(row.get('password', '') or 'changeme123')),
+                        'registered_at':     datetime.now().isoformat(),
+                        'status':            'active',
+                        'role':              'member',
+                        'totp_secret':       '',
+                        'totp_enabled':      'False',
+                    })
+                    added += 1
+                flash(f'Imported {added} member(s).', 'success')
+            except Exception as e:
+                flash(f'Import failed: {e}', 'danger')
 
         return redirect(url_for('admin.members'))
 
+    q = _sanitize(request.args.get('q', ''), 100).lower()
     df = _load(T_MEMBERS, MEMBERS_FILE)
     rows = df.to_dict('records') if not df.empty else []
     for r in rows:
         r.pop('password_hash', None)
+    if q:
+        rows = [r for r in rows if q in (
+            (r.get('full_name','') + ' ' + r.get('email','') + ' ' +
+             r.get('phone','') + ' ' + r.get('house','')).lower()
+        )]
 
     body = render_template_string("""
     <div class="reports-header">
       <div><h1>👥 Members ({{ rows|length }})</h1></div>
       <div class="report-actions">
-        <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-secondary">⬇ All Members</a>
-        <a href="{{ url_for('admin.report', kind='members_full_profile') }}" class="btn btn-secondary">⬇ Full Profiles</a>
-        <a href="{{ url_for('admin.report', kind='members_by_house') }}" class="btn btn-secondary">⬇ By House</a>
+        <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-secondary">⬇ CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='all_members') }}" class="btn btn-secondary">⬇ PDF</a>
+        <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
+      </div>
+    </div>
+
+    <div class="form-container" style="max-width:640px;">
+      <h3>Search</h3>
+      <form method="GET">
+        <div class="form-group" style="display:flex;gap:0.5rem;">
+          <input name="q" value="{{ q }}" placeholder="Name, email, house...">
+          <button class="btn btn-primary">Search</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="form-container">
+      <h3>📥 Bulk Import (CSV)</h3>
+      <p class="form-subtitle">
+        Columns: first_name, last_name, middle_name, email, phone, house,
+        dob_day, dob_month, dob_year, emergency_contact, job_title, industry
+      </p>
+      <form method="POST" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="import">
+        <div class="form-group"><input type="file" name="csv_file" accept=".csv" required></div>
+        <button class="btn btn-primary">Import</button>
+      </form>
+    </div>
+
+    <div class="form-container">
+      <h3>➕ Add Member</h3>
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="add">
+        <div class="form-row">
+          <div class="form-group"><label>First Name *</label>
+            <input name="first_name" required></div>
+          <div class="form-group"><label>Middle Name</label>
+            <input name="middle_name"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>Last Name *</label>
+            <input name="last_name" required></div>
+          <div class="form-group"><label>Email *</label>
+            <input type="email" name="email" required></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>Phone</label>
+            <input name="phone"></div>
+          <div class="form-group"><label>House</label>
+            <input name="house"></div>
+        </div>
+        <button class="btn btn-primary btn-full">Add</button>
+      </form>
+    </div>
+
+    <form method="POST">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="bulk_delete">
+      <div class="table-wrapper">
+        <table class="report-table full-width">
+          <thead><tr>
+            <th style="width:36px;"><input type="checkbox" id="check-all"></th>
+            <th>Name</th><th>Email</th><th>House</th>
+            <th>Role</th><th>Status</th><th>Actions</th>
+          </tr></thead>
+          <tbody>
+          {% for m in rows %}
+            <tr>
+              <td><input type="checkbox" name="member_ids" value="{{ m.member_id }}"></td>
+              <td><strong>{{ m.get('title','') }} {{ m.get('first_name') or m.get('full_name','') }} {{ m.get('last_name','') }}</strong></td>
+              <td>{{ m.get('email','') }}</td>
+              <td>{{ m.get('house','') or '—' }}</td>
+              <td>{{ m.get('role','member') }}</td>
+              <td>{{ m.get('status','active') }}</td>
+              <td>
+                <details>
+                  <summary style="cursor:pointer;color:var(--presec-blue);font-weight:700;">Edit</summary>
+                  <form method="POST" style="margin-top:0.5rem;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action" value="edit">
+                    <input type="hidden" name="member_id" value="{{ m.member_id }}">
+                    <div class="form-group"><label>First</label>
+                      <input name="first_name" value="{{ m.get('first_name','') }}"></div>
+                    <div class="form-group"><label>Middle</label>
+                      <input name="middle_name" value="{{ m.get('middle_name','') }}"></div>
+                    <div class="form-group"><label>Last</label>
+                      <input name="last_name" value="{{ m.get('last_name','') }}"></div>
+                    <div class="form-group"><label>Email</label>
+                      <input name="email" value="{{ m.get('email','') }}"></div>
+                    <div class="form-group"><label>Phone</label>
+                      <input name="phone" value="{{ m.get('phone','') }}"></div>
+                    <div class="form-group"><label>House</label>
+                      <input name="house" value="{{ m.get('house','') }}"></div>
+                    <div class="form-group"><label>Status</label>
+                      <select name="status">
+                        <option value="active" {% if m.get('status','active')=='active' %}selected{% endif %}>active</option>
+                        <option value="suspended" {% if m.get('status')=='suspended' %}selected{% endif %}>suspended</option>
+                      </select></div>
+                    <div class="form-group"><label>Role</label>
+                      <select name="role">
+                        {% for r in ['member','treasurer','secretary','admin'] %}
+                        <option {% if m.get('role','member')==r %}selected{% endif %}>{{ r }}</option>
+                        {% endfor %}
+                      </select></div>
+                    <button class="btn btn-small btn-primary">Save</button>
+                  </form>
+                  <form method="POST" style="margin-top:0.5rem;" onsubmit="return confirm('Delete?');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action" value="delete">
+                    <input type="hidden" name="member_id" value="{{ m.member_id }}">
+                    <button class="btn btn-small btn-primary">🗑️ Delete</button>
+                  </form>
+                </details>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7" class="empty-state">No members.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if rows %}
+      <button class="btn btn-primary" style="margin-top:1rem;"
+              onclick="return confirm('Delete all selected members?');">
+        🗑️ Delete Selected
+      </button>
+      {% endif %}
+    </form>
+
+    <script>
+      document.getElementById('check-all').addEventListener('change', function(e){
+        document.querySelectorAll('input[name="member_ids"]').forEach(function(c){
+          c.checked = e.target.checked;
+        });
+      });
+    </script>
+    """, rows=rows, q=q)
+    return _page(body)
+
+
+# ─────────────────────────────────────────────────────────
+# ADMIN USERS (individual accounts + 2FA)
+# ─────────────────────────────────────────────────────────
+@admin_bp.route('/admin-users', methods=['GET', 'POST'])
+@_admin_required
+def admin_users():
+    csv_path = os.path.join(DATA_DIR, 'admin_users.csv')
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == 'add':
+            email = _sanitize(request.form.get('email', ''), 120).lower()
+            name  = _sanitize(request.form.get('full_name', ''), 120)
+            pwd   = request.form.get('password', '')
+            role  = _sanitize(request.form.get('role', 'admin'), 20)
+            if email and len(pwd) >= 8:
+                _insert(T_ADMIN_USERS, csv_path, {
+                    'admin_id': f"ADM{int(time.time())}{random.randint(100,999)}",
+                    'email': email,
+                    'full_name': name,
+                    'password_hash': generate_password_hash(pwd),
+                    'role': role,
+                    'created_at': datetime.now().isoformat(),
+                    'last_login': '',
+                    'active': 'True',
+                    'totp_secret': '',
+                    'totp_enabled': 'False',
+                })
+                flash(f'Admin added: {email}', 'success')
+        elif action == 'delete':
+            aid = request.form.get('admin_id')
+            if aid and _delete_where(T_ADMIN_USERS, csv_path, 'admin_id', aid):
+                flash('Admin removed.', 'success')
+        return redirect(url_for('admin.admin_users'))
+
+    df = _load(T_ADMIN_USERS, csv_path)
+    rows = df.to_dict('records') if not df.empty else []
+    for r in rows:
+        r.pop('password_hash', None)
+        r.pop('totp_secret', None)
+
+    body = render_template_string("""
+    <div class="reports-header">
+      <div><h1>🔐 Admin Accounts</h1></div>
+      <div class="report-actions">
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
 
     <div class="form-container">
-      <h1>➕ Add Member</h1>
-      <p class="form-subtitle">Default password: changeme123</p>
+      <h3>➕ Add Admin</h3>
+      <p class="form-subtitle">Each admin has their own login, tracked in history</p>
       <form method="POST">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="add">
-
         <div class="form-row">
-          <div class="form-group"><label>Title</label>
-            <select name="title">
-              <option value="">—</option>
-              {% for t in titles %}<option>{{ t }}</option>{% endfor %}
-            </select></div>
-          <div class="form-group"><label>House</label>
-            <input name="house" maxlength="60"></div>
-        </div>
-        <div class="form-row">
-          <div class="form-group"><label>First Name *</label>
-            <input name="first_name" required maxlength="120"></div>
-          <div class="form-group"><label>Middle Name</label>
-            <input name="middle_name" maxlength="120"></div>
-        </div>
-        <div class="form-group"><label>Last Name *</label>
-          <input name="last_name" required maxlength="120"></div>
-        <div class="form-row" style="grid-template-columns: 1fr 2fr 1fr;">
-          <div class="form-group"><label>DOB Day</label>
-            <input name="dob_day" type="number" min="1" max="31"></div>
-          <div class="form-group"><label>DOB Month</label>
-            <select name="dob_month">
-              <option value="">—</option>
-              {% for m in months %}<option>{{ m }}</option>{% endfor %}
-            </select></div>
-          <div class="form-group"><label>DOB Year</label>
-            <input name="dob_year" type="number" min="1900" max="2026"></div>
-        </div>
-        <div class="form-row">
+          <div class="form-group"><label>Full Name</label>
+            <input name="full_name" required></div>
           <div class="form-group"><label>Email *</label>
-            <input type="email" name="email" required maxlength="120"></div>
-          <div class="form-group"><label>Phone</label>
-            <input name="phone" maxlength="40"></div>
+            <input type="email" name="email" required></div>
         </div>
-        <div class="form-group"><label>Emergency Contact</label>
-          <input name="emergency_contact" maxlength="200"></div>
         <div class="form-row">
-          <div class="form-group"><label>Job Title</label>
-            <input name="job_title" maxlength="120"></div>
-          <div class="form-group"><label>Industry</label>
-            <input name="industry" maxlength="120"></div>
+          <div class="form-group"><label>Password * (min 8)</label>
+            <input type="password" name="password" required minlength="8"></div>
+          <div class="form-group"><label>Role</label>
+            <select name="role">
+              <option value="admin">admin</option>
+              <option value="treasurer">treasurer</option>
+              <option value="secretary">secretary</option>
+            </select></div>
         </div>
-        <button class="btn btn-primary btn-full">Add Member</button>
+        <button class="btn btn-primary btn-full">Add Admin</button>
       </form>
     </div>
 
     <div class="table-wrapper">
       <table class="report-table full-width">
         <thead><tr>
-          <th>Name</th><th>Email</th><th>DOB</th><th>Phone</th>
-          <th>House</th><th>Job</th><th>Industry</th><th>Actions</th>
+          <th>Name</th><th>Email</th><th>Role</th>
+          <th>Last Login</th><th>Actions</th>
         </tr></thead>
         <tbody>
-        {% for m in rows %}
-          <tr>
-            <td><strong>{{ m.get('title','') }} {{ m.get('first_name') or m.get('full_name','') }} {{ m.get('middle_name','') }} {{ m.get('last_name','') }}</strong></td>
-            <td>{{ m.get('email','') }}</td>
-            <td>
-              {% if m.get('dob_day') or m.get('dob_month') or m.get('dob_year') %}
-                {{ m.get('dob_day','') }} {{ m.get('dob_month','') }} {{ m.get('dob_year','') }}
-              {% else %}—{% endif %}
-            </td>
-            <td>{{ m.get('phone','') or '—' }}</td>
-            <td>{{ m.get('house','') or '—' }}</td>
-            <td>{{ m.get('job_title','') or '—' }}</td>
-            <td>{{ m.get('industry','') or '—' }}</td>
-            <td>
-              <details>
-                <summary style="cursor:pointer;color:var(--presec-blue);font-weight:700;">Edit</summary>
-                <form method="POST" style="margin-top:0.5rem;">
-                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                  <input type="hidden" name="action" value="edit">
-                  <input type="hidden" name="member_id" value="{{ m.member_id }}">
-                  <div class="form-row">
-                    <div class="form-group"><label>Title</label>
-                      <select name="title">
-                        <option value="">—</option>
-                        {% for t in titles %}
-                          <option {% if m.get('title') == t %}selected{% endif %}>{{ t }}</option>
-                        {% endfor %}
-                      </select></div>
-                    <div class="form-group"><label>House</label>
-                      <input name="house" value="{{ m.get('house','') }}" maxlength="60"></div>
-                  </div>
-                  <div class="form-row">
-                    <div class="form-group"><label>First Name</label>
-                      <input name="first_name" value="{{ m.get('first_name','') }}" maxlength="120"></div>
-                    <div class="form-group"><label>Middle Name</label>
-                      <input name="middle_name" value="{{ m.get('middle_name','') }}" maxlength="120"></div>
-                  </div>
-                  <div class="form-group"><label>Last Name</label>
-                    <input name="last_name" value="{{ m.get('last_name','') }}" maxlength="120"></div>
-                  <div class="form-row" style="grid-template-columns: 1fr 2fr 1fr;">
-                    <div class="form-group"><label>DOB Day</label>
-                      <input name="dob_day" type="number" min="1" max="31"
-                             value="{{ m.get('dob_day','') }}"></div>
-                    <div class="form-group"><label>DOB Month</label>
-                      <select name="dob_month">
-                        <option value="">—</option>
-                        {% for mo in months %}
-                          <option {% if m.get('dob_month') == mo %}selected{% endif %}>{{ mo }}</option>
-                        {% endfor %}
-                      </select></div>
-                    <div class="form-group"><label>DOB Year</label>
-                      <input name="dob_year" type="number" min="1900" max="2026"
-                             value="{{ m.get('dob_year','') }}"></div>
-                  </div>
-                  <div class="form-row">
-                    <div class="form-group"><label>Email</label>
-                      <input name="email" value="{{ m.get('email','') }}" maxlength="120"></div>
-                    <div class="form-group"><label>Phone</label>
-                      <input name="phone" value="{{ m.get('phone','') }}" maxlength="40"></div>
-                  </div>
-                  <div class="form-group"><label>Emergency Contact</label>
-                    <input name="emergency_contact" value="{{ m.get('emergency_contact','') }}" maxlength="200"></div>
-                  <div class="form-row">
-                    <div class="form-group"><label>Job Title</label>
-                      <input name="job_title" value="{{ m.get('job_title','') }}" maxlength="120"></div>
-                    <div class="form-group"><label>Industry</label>
-                      <input name="industry" value="{{ m.get('industry','') }}" maxlength="120"></div>
-                  </div>
-                  <button class="btn btn-small btn-primary">Save</button>
-                </form>
-                <form method="POST" style="margin-top:0.5rem;"
-                      onsubmit="return confirm('Delete this member?');">
-                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                  <input type="hidden" name="action" value="delete">
-                  <input type="hidden" name="member_id" value="{{ m.member_id }}">
-                  <button class="btn btn-small btn-primary">🗑️ Delete</button>
-                </form>
-              </details>
-            </td>
-          </tr>
+        {% for r in rows %}
+        <tr>
+          <td><strong>{{ r.get('full_name','') }}</strong></td>
+          <td>{{ r.get('email','') }}</td>
+          <td>{{ r.get('role','admin') }}</td>
+          <td>{{ r.get('last_login','')[:19] or 'Never' }}</td>
+          <td>
+            <form method="POST" onsubmit="return confirm('Remove this admin?');">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="admin_id" value="{{ r.admin_id }}">
+              <button class="btn btn-small btn-primary">🗑️ Remove</button>
+            </form>
+          </td>
+        </tr>
         {% else %}
-          <tr><td colspan="8" class="empty-state">No members yet.</td></tr>
+        <tr><td colspan="5" class="empty-state">No individual admins yet.</td></tr>
         {% endfor %}
         </tbody>
       </table>
     </div>
-    """, rows=rows, months=MONTHS, titles=TITLES)
+    """, rows=rows)
+    return _page(body)
+
+
+# ─────────────────────────────────────────────────────────
+# LOGIN HISTORY (admin view)
+# ─────────────────────────────────────────────────────────
+@admin_bp.route('/login-history')
+@_admin_required
+def login_history():
+    rows = sb.fetch_all(T_LOGIN_HISTORY)[-500:]
+    rows = list(reversed(rows))
+
+    body = render_template_string("""
+    <div class="reports-header">
+      <div><h1>🔐 Login History</h1>
+      <p class="subtitle">Last 500 events (all accounts)</p></div>
+      <div class="report-actions">
+        <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
+      </div>
+    </div>
+
+    <div class="table-wrapper">
+      <table class="report-table full-width">
+        <thead><tr>
+          <th>When</th><th>Type</th><th>Subject</th>
+          <th>IP</th><th>Result</th><th>Device</th>
+        </tr></thead>
+        <tbody>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r.happened_at[:19] }}</td>
+          <td>{{ r.subject_type }}</td>
+          <td>{{ r.subject_id or '—' }}</td>
+          <td>{{ r.ip_address }}</td>
+          <td>{{ '✅ Success' if r.success == 'True' else '❌ Failed' }}</td>
+          <td style="font-size:0.78rem;color:#666;">{{ r.user_agent[:60] }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="empty-state">No login history.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    """, rows=rows)
     return _page(body)
 
 
 # ═══════════════════════════════════════════════════════════
-# REPORTS HUB
+# REPORTS HUB (with PDF buttons)
 # ═══════════════════════════════════════════════════════════
 @admin_bp.route('/reports')
 @_admin_required
@@ -1350,10 +1518,9 @@ def reports():
 
     body = render_template_string("""
     <div class="reports-header">
-      <div><h1>📈 Reports & Downloads</h1>
-      <p class="subtitle">All reports • downloadable as CSV</p></div>
+      <div><h1>📈 Reports</h1><p class="subtitle">CSV and PDF downloads</p></div>
       <div class="report-actions">
-        <a href="{{ url_for('admin.backup') }}" class="btn btn-primary">💾 Full Backup (ZIP)</a>
+        <a href="{{ url_for('admin.backup') }}" class="btn btn-primary">💾 Full Backup</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
@@ -1367,104 +1534,103 @@ def reports():
         <div class="stat-title">Contributions</div></div>
       <div class="report-stat-card"><div class="stat-icon">📅</div>
         <div class="stat-value">GH₵{{ "%.2f"|format(dues_total) }}</div>
-        <div class="stat-title">Dues Collected</div></div>
+        <div class="stat-title">Dues</div></div>
       <div class="report-stat-card"><div class="stat-icon">🗳️</div>
         <div class="stat-value">{{ votes_count }}</div>
-        <div class="stat-title">Votes Cast</div>
-        <div class="stat-sub">{{ polls_count }} polls</div></div>
+        <div class="stat-title">Votes</div></div>
     </div>
 
     <div class="report-section">
-      <h2>🗳️ Voting Reports</h2>
+      <h2>🗳️ Voting</h2>
       <div class="report-cards-grid">
         <div class="report-card"><h3>All Polls</h3>
-          <a href="{{ url_for('admin.report', kind='all_polls') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='all_polls') }}" class="btn btn-primary">⬇ CSV</a>
+          <a href="{{ url_for('admin.report_pdf', kind='all_polls') }}" class="btn btn-secondary">⬇ PDF</a></div>
         <div class="report-card"><h3>All Votes</h3>
-          <a href="{{ url_for('admin.report', kind='all_votes') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Turnout by Poll</h3>
-          <a href="{{ url_for('admin.report', kind='turnout') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='all_votes') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>Turnout</h3>
+          <a href="{{ url_for('admin.report', kind='turnout') }}" class="btn btn-primary">⬇ CSV</a></div>
       </div>
     </div>
 
     <div class="report-section">
-      <h2>📅 Dues Reports</h2>
+      <h2>📅 Dues</h2>
       <div class="report-cards-grid">
         <div class="report-card"><h3>All Dues Periods</h3>
-          <a href="{{ url_for('admin.report', kind='all_dues_plans') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='all_dues_plans') }}" class="btn btn-primary">⬇ CSV</a>
+          <a href="{{ url_for('admin.report_pdf', kind='all_dues_plans') }}" class="btn btn-secondary">⬇ PDF</a></div>
         <div class="report-card"><h3>All Dues Payments</h3>
-          <a href="{{ url_for('admin.report', kind='all_dues') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Outstanding Dues</h3>
-          <a href="{{ url_for('admin.report', kind='outstanding_dues') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Top Dues Payers</h3>
-          <a href="{{ url_for('admin.report', kind='top_dues_payers') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='all_dues') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>Outstanding</h3>
+          <a href="{{ url_for('admin.report', kind='outstanding_dues') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>Top Payers</h3>
+          <a href="{{ url_for('admin.report', kind='top_dues_payers') }}" class="btn btn-primary">⬇ CSV</a></div>
       </div>
     </div>
 
     <div class="report-section">
-      <h2>🎯 Contribution Reports</h2>
+      <h2>🎯 Contributions</h2>
       <div class="report-cards-grid">
         <div class="report-card"><h3>All Campaigns</h3>
-          <a href="{{ url_for('admin.report', kind='all_campaigns') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='all_campaigns') }}" class="btn btn-primary">⬇ CSV</a>
+          <a href="{{ url_for('admin.report_pdf', kind='all_campaigns') }}" class="btn btn-secondary">⬇ PDF</a></div>
         <div class="report-card"><h3>All Contributions</h3>
-          <a href="{{ url_for('admin.report', kind='all_contributions') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Outstanding Contributions</h3>
-          <a href="{{ url_for('admin.report', kind='outstanding_contribs') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='all_contributions') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>Outstanding</h3>
+          <a href="{{ url_for('admin.report', kind='outstanding_contribs') }}" class="btn btn-primary">⬇ CSV</a></div>
         <div class="report-card"><h3>Top Contributors</h3>
-          <a href="{{ url_for('admin.report', kind='top_contributors') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='top_contributors') }}" class="btn btn-primary">⬇ CSV</a></div>
       </div>
     </div>
 
     <div class="report-section">
-      <h2>👥 Membership Reports</h2>
+      <h2>👥 Membership</h2>
       <div class="report-cards-grid">
         <div class="report-card"><h3>All Members</h3>
-          <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Full Member Profiles</h3>
-          <a href="{{ url_for('admin.report', kind='members_full_profile') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-primary">⬇ CSV</a>
+          <a href="{{ url_for('admin.report_pdf', kind='all_members') }}" class="btn btn-secondary">⬇ PDF</a></div>
+        <div class="report-card"><h3>Full Profiles</h3>
+          <a href="{{ url_for('admin.report', kind='members_full_profile') }}" class="btn btn-primary">⬇ CSV</a></div>
         <div class="report-card"><h3>By House</h3>
-          <a href="{{ url_for('admin.report', kind='members_by_house') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>By Registration Month</h3>
-          <a href="{{ url_for('admin.report', kind='members_by_year') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Inactive Members</h3>
-          <a href="{{ url_for('admin.report', kind='inactive_members') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Contact Directory</h3>
-          <a href="{{ url_for('admin.report', kind='contact_directory') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Members by Industry</h3>
-          <a href="{{ url_for('admin.report', kind='members_by_industry') }}" class="btn btn-primary">⬇ Download</a></div>
-        <div class="report-card"><h3>Members by Job Title</h3>
-          <a href="{{ url_for('admin.report', kind='members_by_job') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='members_by_house') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>By Industry</h3>
+          <a href="{{ url_for('admin.report', kind='members_by_industry') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>By Job Title</h3>
+          <a href="{{ url_for('admin.report', kind='members_by_job') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>Inactive</h3>
+          <a href="{{ url_for('admin.report', kind='inactive_members') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>Contacts</h3>
+          <a href="{{ url_for('admin.report', kind='contact_directory') }}" class="btn btn-primary">⬇ CSV</a></div>
         <div class="report-card"><h3>Birthdays</h3>
           <form method="GET" action="{{ url_for('admin.report', kind='birthdays') }}">
-            <div class="form-group" style="margin-bottom:0.5rem;">
-              <select name="month">
-                <option value="">All months</option>
-                {% for m in months %}<option>{{ m }}</option>{% endfor %}
-              </select>
-            </div>
-            <button class="btn btn-primary">⬇ Download</button>
+            <select name="month" style="margin-bottom:0.5rem;">
+              <option value="">All months</option>
+              {% for m in months %}<option>{{ m }}</option>{% endfor %}
+            </select>
+            <button class="btn btn-primary">⬇ CSV</button>
           </form>
         </div>
       </div>
     </div>
 
     <div class="report-section">
-      <h2>📊 Combined Reports</h2>
+      <h2>📊 Combined</h2>
       <div class="report-cards-grid">
         <div class="report-card"><h3>Master Financial</h3>
-          <a href="{{ url_for('admin.report', kind='master_financial') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='master_financial') }}" class="btn btn-primary">⬇ CSV</a></div>
         <div class="report-card"><h3>Executive Summary</h3>
-          <a href="{{ url_for('admin.report', kind='executive_summary') }}" class="btn btn-primary">⬇ Download</a></div>
+          <a href="{{ url_for('admin.report', kind='executive_summary') }}" class="btn btn-primary">⬇ CSV</a>
+          <a href="{{ url_for('admin.report_pdf', kind='executive_summary') }}" class="btn btn-secondary">⬇ PDF</a></div>
       </div>
     </div>
     """,
     member_count=len(members), contrib_total=_sum(contrib),
-    dues_total=_sum(dues), votes_count=len(votes), polls_count=len(polls),
-    months=MONTHS)
+    dues_total=_sum(dues), votes_count=len(votes), months=MONTHS)
     return _page(body)
 
 
 # ═══════════════════════════════════════════════════════════
-# REPORT ROUTER
+# REPORT ROUTER (CSV)
 # ═══════════════════════════════════════════════════════════
 @admin_bp.route('/report/<kind>')
 @_admin_required
@@ -1479,17 +1645,26 @@ def report(kind):
     dues_payments  = _load(T_DUES, DUES_FILE)
     dues_plans     = _load(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE)
 
+    from_date = _sanitize(request.args.get('from', ''), 10)
+    to_date   = _sanitize(request.args.get('to', ''), 10)
+
     def _amt(df, col='amount'):
         if df.empty or col not in df.columns:
             return 0.0
         return float(pd.to_numeric(df[col], errors='coerce').fillna(0).sum())
 
     def _records(df):
-        return df.to_dict('records') if not df.empty else []
+        if df.empty:
+            return []
+        if from_date and 'created_at' in df.columns:
+            df = df[df['created_at'].str[:10] >= from_date]
+        if to_date and 'created_at' in df.columns:
+            df = df[df['created_at'].str[:10] <= to_date]
+        return df.to_dict('records')
 
     if kind == 'all_polls':
         rows = []
-        member_count = len(members)
+        mc = len(members)
         for _, p in polls.iterrows():
             pid = p['poll_id']
             pv = votes[votes['poll_id'] == pid] if not votes.empty else pd.DataFrame()
@@ -1506,13 +1681,13 @@ def report(kind):
                         winner = o['text']; break
             rows.append({
                 'poll_id': pid, 'title': p['title'],
-                'description': p.get('description', ''),
-                'active': p.get('active', ''),
                 'created_at': p.get('created_at', ''),
-                'option_count': len(opts),
-                'total_votes': len(pv),
-                'turnout_pct': round(len(pv) / member_count * 100, 1) if member_count else 0,
+                'option_count': len(opts), 'total_votes': len(pv),
+                'turnout_pct': round(len(pv) / mc * 100, 1) if mc else 0,
                 'winner': winner,
+                'anonymous': p.get('anonymous', 'False'),
+                'open_at': p.get('open_at', ''),
+                'close_at': p.get('close_at', ''),
             })
         return _csv_response(rows, f'all_polls_{ts}.csv')
 
@@ -1528,115 +1703,68 @@ def report(kind):
             opts = []
         pv = votes[votes['poll_id'] == poll_id] if not votes.empty else pd.DataFrame()
         tally = pv['option_id'].value_counts().to_dict() if not pv.empty else {}
-        total = len(pv); member_count = len(members)
+        total = len(pv)
         rows = []
         for o in opts:
             c = tally.get(o['id'], 0)
             rows.append({
                 'poll_id': poll_id, 'title': p['title'],
-                'option_id': o['id'], 'option_text': o['text'],
-                'votes': c,
+                'option_text': o['text'], 'votes': c,
                 'pct': round(c / total * 100, 2) if total else 0,
-                'total_poll_votes': total,
-                'turnout_pct': round(total / member_count * 100, 1) if member_count else 0,
             })
         return _csv_response(rows, f'poll_{poll_id}_{ts}.csv')
 
     if kind == 'all_votes':
         rows = _records(votes)
         poll_titles = {r['poll_id']: r['title'] for _, r in polls.iterrows()} if not polls.empty else {}
-        option_texts = {}
-        for _, p in polls.iterrows():
-            try:
-                for o in json.loads(p.get('options_json', '[]')):
-                    option_texts[(p['poll_id'], o['id'])] = o['text']
-            except Exception:
-                pass
         for r in rows:
             r['poll_title'] = poll_titles.get(r.get('poll_id', ''), '')
-            r['option_text'] = option_texts.get((r.get('poll_id', ''), r.get('option_id', '')), '')
         return _csv_response(rows, f'all_votes_{ts}.csv')
 
-    if kind == 'poll_votes':
-        poll_id = request.args.get('poll_id', '')
-        pv = votes[votes['poll_id'] == poll_id] if not votes.empty else pd.DataFrame()
-        return _csv_response(_records(pv), f'poll_votes_{poll_id}_{ts}.csv')
-
     if kind == 'turnout':
-        member_count = len(members)
+        mc = len(members)
         rows = []
         for _, p in polls.iterrows():
             pid = p['poll_id']
             pv = votes[votes['poll_id'] == pid] if not votes.empty else pd.DataFrame()
             voters = set(pv['member_id'].tolist()) if not pv.empty else set()
-            non_voters = members[~members['member_id'].isin(voters)]['full_name'].tolist() if not members.empty else []
             rows.append({
                 'poll_id': pid, 'poll_title': p['title'],
-                'total_members': member_count,
-                'voted': len(voters),
-                'did_not_vote': len(non_voters),
-                'turnout_pct': round(len(voters) / member_count * 100, 1) if member_count else 0,
-                'non_voters': '; '.join(non_voters[:50]),
+                'total_members': mc, 'voted': len(voters),
+                'did_not_vote': mc - len(voters),
+                'turnout_pct': round(len(voters) / mc * 100, 1) if mc else 0,
             })
         return _csv_response(rows, f'turnout_{ts}.csv')
 
     if kind == 'all_dues_plans':
-        member_count = len(members)
+        mc = len(members)
         rows = []
         for _, d in dues_plans.iterrows():
             did = d['dues_id']
             amount = float(d.get('amount', 0) or 0)
             paid = dues_payments[dues_payments['dues_id'] == did] if not dues_payments.empty else pd.DataFrame()
             collected = _amt(paid)
-            expected = amount * member_count
+            expected = amount * mc
             paid_ids = set(paid['member_id'].tolist()) if not paid.empty else set()
             rows.append({
                 'dues_id': did, 'month': d.get('month', ''), 'year': d.get('year', ''),
                 'amount_per_member': amount, 'total_expected': expected,
                 'total_collected': collected, 'outstanding': expected - collected,
                 'collection_pct': round(collected / expected * 100, 1) if expected else 0,
-                'paid_count': len(paid_ids),
-                'unpaid_count': member_count - len(paid_ids),
-                'total_members': member_count,
-                'active': d.get('active', ''), 'created_at': d.get('created_at', ''),
+                'paid_count': len(paid_ids), 'unpaid_count': mc - len(paid_ids),
             })
         return _csv_response(rows, f'all_dues_plans_{ts}.csv')
 
     if kind == 'dues_plan':
         dues_id = request.args.get('dues_id', '')
-        d = dues_plans[dues_plans['dues_id'] == dues_id] if not dues_plans.empty else pd.DataFrame()
-        if d.empty:
-            flash('Dues period not found.', 'danger'); return redirect(url_for('admin.reports'))
-        d = d.iloc[0]
         paid = dues_payments[dues_payments['dues_id'] == dues_id] if not dues_payments.empty else pd.DataFrame()
-        rows = _records(paid)
-        for r in rows:
-            r['dues_id'] = dues_id
-            r['month'] = d.get('month', '')
-            r['year'] = d.get('year', '')
-        return _csv_response(rows, f'dues_plan_{dues_id}_{ts}.csv')
+        return _csv_response(_records(paid), f'dues_plan_{dues_id}_{ts}.csv')
 
     if kind == 'all_dues':
         return _csv_response(_records(dues_payments), f'all_dues_{ts}.csv')
 
-    if kind == 'dues_month':
-        month = request.args.get('month', '')
-        year  = request.args.get('year', '')
-        if not (month and year):
-            flash('Month and year required.', 'danger'); return redirect(url_for('admin.reports'))
-        plans = dues_plans[(dues_plans['month'].str.lower() == month.lower()) &
-                           (dues_plans['year'].astype(str) == str(year))] if not dues_plans.empty else pd.DataFrame()
-        if plans.empty:
-            flash(f'No dues found for {month} {year}.', 'warning'); return redirect(url_for('admin.reports'))
-        dues_ids = plans['dues_id'].tolist()
-        paid = dues_payments[dues_payments['dues_id'].isin(dues_ids)] if not dues_payments.empty else pd.DataFrame()
-        rows = _records(paid)
-        for r in rows:
-            r['month'] = month; r['year'] = year
-        return _csv_response(rows, f'dues_{month}_{year}_{ts}.csv')
-
     if kind == 'outstanding_dues':
-        member_count = len(members)
+        mc = len(members)
         rows = []
         for _, d in dues_plans.iterrows():
             did = d['dues_id']
@@ -1647,12 +1775,8 @@ def report(kind):
             for _, m in unpaid.iterrows():
                 rows.append({
                     'dues_id': did, 'month': d.get('month', ''), 'year': d.get('year', ''),
-                    'amount_owed': d.get('amount', ''),
-                    'member_id': m.get('member_id', ''),
                     'member_name': m.get('full_name', ''),
-                    'email': m.get('email', ''),
-                    'phone': m.get('phone', ''),
-                    'house': m.get('house', ''),
+                    'email': m.get('email', ''), 'phone': m.get('phone', ''),
                 })
         return _csv_response(rows, f'outstanding_dues_{ts}.csv')
 
@@ -1661,16 +1785,16 @@ def report(kind):
             return _csv_response([], f'top_dues_payers_{ts}.csv')
         df = dues_payments.copy()
         df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
-        grouped = df.groupby(['member_id', 'member_name'])['amount'].sum().reset_index()
-        grouped = grouped.sort_values('amount', ascending=False)
+        g = df.groupby(['member_id', 'member_name'])['amount'].sum().reset_index()
+        g = g.sort_values('amount', ascending=False)
         rows = []
-        for i, r in enumerate(grouped.to_dict('records'), 1):
+        for i, r in enumerate(g.to_dict('records'), 1):
             r['rank'] = i; r['total_paid'] = r.pop('amount')
             rows.append(r)
         return _csv_response(rows, f'top_dues_payers_{ts}.csv')
 
     if kind == 'all_campaigns':
-        member_count = len(members)
+        mc = len(members)
         rows = []
         for _, c in campaigns.iterrows():
             cid = c['campaign_id']
@@ -1680,41 +1804,20 @@ def report(kind):
             paid_ids = set(sub['member_id'].tolist()) if not sub.empty else set()
             rows.append({
                 'campaign_id': cid, 'title': c['title'],
-                'description': c.get('description', ''),
                 'target': target, 'raised': raised,
                 'remaining': max(target - raised, 0),
                 'funded_pct': round(raised / target * 100, 1) if target else 0,
-                'paid_count': len(paid_ids),
-                'unpaid_count': member_count - len(paid_ids),
-                'total_members': member_count,
-                'active': c.get('active', ''),
-                'created_at': c.get('created_at', ''),
+                'paid_count': len(paid_ids), 'unpaid_count': mc - len(paid_ids),
             })
         return _csv_response(rows, f'all_campaigns_{ts}.csv')
 
     if kind == 'campaign':
         cid = request.args.get('campaign_id', '')
-        c = campaigns[campaigns['campaign_id'] == cid] if not campaigns.empty else pd.DataFrame()
-        if c.empty:
-            flash('Campaign not found.', 'danger'); return redirect(url_for('admin.reports'))
-        c = c.iloc[0]
         sub = contribs[contribs['campaign_id'] == cid] if not contribs.empty else pd.DataFrame()
-        rows = _records(sub)
-        for r in rows:
-            r['campaign_id'] = cid; r['campaign_title'] = c['title']
-        return _csv_response(rows, f'campaign_{cid}_{ts}.csv')
+        return _csv_response(_records(sub), f'campaign_{cid}_{ts}.csv')
 
     if kind == 'all_contributions':
-        rows = _records(contribs)
-        titles = {r['campaign_id']: r['title'] for _, r in campaigns.iterrows()} if not campaigns.empty else {}
-        for r in rows:
-            r['campaign_title'] = titles.get(r.get('campaign_id', ''), '')
-        return _csv_response(rows, f'all_contributions_{ts}.csv')
-
-    if kind == 'campaign_payments':
-        cid = request.args.get('campaign_id', '')
-        sub = contribs[contribs['campaign_id'] == cid] if not contribs.empty else pd.DataFrame()
-        return _csv_response(_records(sub), f'campaign_payments_{cid}_{ts}.csv')
+        return _csv_response(_records(contribs), f'all_contributions_{ts}.csv')
 
     if kind == 'outstanding_contribs':
         rows = []
@@ -1727,12 +1830,8 @@ def report(kind):
             for _, m in unpaid.iterrows():
                 rows.append({
                     'campaign_id': cid, 'campaign_title': c['title'],
-                    'target': c.get('target_amount', ''),
-                    'member_id': m.get('member_id', ''),
                     'member_name': m.get('full_name', ''),
-                    'email': m.get('email', ''),
-                    'phone': m.get('phone', ''),
-                    'house': m.get('house', ''),
+                    'email': m.get('email', ''), 'phone': m.get('phone', ''),
                 })
         return _csv_response(rows, f'outstanding_contribs_{ts}.csv')
 
@@ -1741,12 +1840,10 @@ def report(kind):
             return _csv_response([], f'top_contributors_{ts}.csv')
         df = contribs.copy()
         df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
-        grouped = df.groupby(['member_id', 'member_name'])['amount'].sum().reset_index()
-        counts = df.groupby(['member_id'])['contribution_id'].count().reset_index(name='contributions_count')
-        grouped = grouped.merge(counts, on='member_id', how='left')
-        grouped = grouped.sort_values('amount', ascending=False)
+        g = df.groupby(['member_id', 'member_name'])['amount'].sum().reset_index()
+        g = g.sort_values('amount', ascending=False)
         rows = []
-        for i, r in enumerate(grouped.to_dict('records'), 1):
+        for i, r in enumerate(g.to_dict('records'), 1):
             r['rank'] = i; r['total_contributed'] = r.pop('amount')
             rows.append(r)
         return _csv_response(rows, f'top_contributors_{ts}.csv')
@@ -1758,35 +1855,18 @@ def report(kind):
         return _csv_response(_records(df), f'all_members_{ts}.csv')
 
     if kind == 'members_full_profile':
-        if members.empty:
-            return _csv_response([], f'members_full_profile_{ts}.csv')
         df = members.copy()
         if 'password_hash' in df.columns:
             df = df.drop(columns=['password_hash'])
-        for col in ['title','first_name','middle_name','last_name',
-                    'dob_day','dob_month','dob_year',
-                    'emergency_contact','job_title','industry']:
-            if col not in df.columns:
-                df[col] = ''
-        desired = ['member_id','title','first_name','middle_name','last_name',
-                   'dob_day','dob_month','dob_year',
-                   'email','phone','house',
-                   'emergency_contact','job_title','industry',
-                   'registered_at','full_name']
-        ordered = [c for c in desired if c in df.columns]
-        extra = [c for c in df.columns if c not in ordered]
-        df = df[ordered + extra]
         return _csv_response(_records(df), f'members_full_profile_{ts}.csv')
 
     if kind == 'members_by_house':
         df = members.copy()
-        if 'password_hash' in df.columns:
-            df = df.drop(columns=['password_hash'])
         df['house'] = df['house'].replace('', 'Not Specified').fillna('Not Specified')
-        grouped = df.groupby('house').size().reset_index(name='count')
-        grouped = grouped.sort_values('count', ascending=False)
+        g = df.groupby('house').size().reset_index(name='count')
+        g = g.sort_values('count', ascending=False)
         rows = []
-        for _, r in grouped.iterrows():
+        for _, r in g.iterrows():
             names = df[df['house'] == r['house']]['full_name'].tolist()
             rows.append({'house': r['house'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_house_{ts}.csv')
@@ -1796,10 +1876,10 @@ def report(kind):
         if df.empty:
             return _csv_response([], f'members_by_year_{ts}.csv')
         df['reg_month'] = df['registered_at'].str[:7]
-        grouped = df.groupby('reg_month').size().reset_index(name='count')
-        grouped = grouped.sort_values('reg_month', ascending=False)
+        g = df.groupby('reg_month').size().reset_index(name='count')
+        g = g.sort_values('reg_month', ascending=False)
         rows = []
-        for _, r in grouped.iterrows():
+        for _, r in g.iterrows():
             names = df[df['reg_month'] == r['reg_month']]['full_name'].tolist()
             rows.append({'month': r['reg_month'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_year_{ts}.csv')
@@ -1810,48 +1890,40 @@ def report(kind):
         contributor_ids = set(contribs['member_id'].tolist()) if not contribs.empty else set()
         active_ids = voter_ids | payer_ids | contributor_ids
         inactive = members[~members['member_id'].isin(active_ids)] if not members.empty else pd.DataFrame()
-        df = inactive.copy()
-        if 'password_hash' in df.columns:
-            df = df.drop(columns=['password_hash'])
-        return _csv_response(_records(df), f'inactive_members_{ts}.csv')
+        if 'password_hash' in inactive.columns:
+            inactive = inactive.drop(columns=['password_hash'])
+        return _csv_response(_records(inactive), f'inactive_members_{ts}.csv')
 
     if kind == 'contact_directory':
-        if members.empty:
-            return _csv_response([], f'contact_directory_{ts}.csv')
         cols = ['title','first_name','middle_name','last_name','email','phone','house']
         cols = [c for c in cols if c in members.columns]
-        return _csv_response(_records(members[cols]), f'contact_directory_{ts}.csv')
+        return _csv_response(_records(members[cols]) if not members.empty else [],
+                             f'contact_directory_{ts}.csv')
 
     if kind == 'members_by_industry':
         df = members.copy()
-        if df.empty:
-            return _csv_response([], f'members_by_industry_{ts}.csv')
         df['industry'] = df['industry'].replace('', 'Not Specified').fillna('Not Specified')
-        grouped = df.groupby('industry').size().reset_index(name='count')
-        grouped = grouped.sort_values('count', ascending=False)
+        g = df.groupby('industry').size().reset_index(name='count')
+        g = g.sort_values('count', ascending=False)
         rows = []
-        for _, r in grouped.iterrows():
+        for _, r in g.iterrows():
             names = df[df['industry'] == r['industry']]['full_name'].tolist()
             rows.append({'industry': r['industry'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_industry_{ts}.csv')
 
     if kind == 'members_by_job':
         df = members.copy()
-        if df.empty:
-            return _csv_response([], f'members_by_job_{ts}.csv')
         df['job_title'] = df['job_title'].replace('', 'Not Specified').fillna('Not Specified')
-        grouped = df.groupby('job_title').size().reset_index(name='count')
-        grouped = grouped.sort_values('count', ascending=False)
+        g = df.groupby('job_title').size().reset_index(name='count')
+        g = g.sort_values('count', ascending=False)
         rows = []
-        for _, r in grouped.iterrows():
+        for _, r in g.iterrows():
             names = df[df['job_title'] == r['job_title']]['full_name'].tolist()
             rows.append({'job_title': r['job_title'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_job_{ts}.csv')
 
     if kind == 'birthdays':
         month = request.args.get('month', '')
-        if members.empty:
-            return _csv_response([], f'birthdays_{ts}.csv')
         df = members.copy()
         if month:
             df = df[df['dob_month'].str.lower() == month.lower()]
@@ -1859,16 +1931,11 @@ def report(kind):
         rows = []
         for _, m in df.iterrows():
             rows.append({
-                'title': m.get('title',''),
-                'first_name': m.get('first_name',''),
-                'middle_name': m.get('middle_name',''),
-                'last_name': m.get('last_name',''),
-                'dob_day': m.get('dob_day',''),
-                'dob_month': m.get('dob_month',''),
-                'dob_year': m.get('dob_year',''),
-                'email': m.get('email',''),
-                'phone': m.get('phone',''),
-                'house': m.get('house',''),
+                'title': m.get('title',''), 'first_name': m.get('first_name',''),
+                'middle_name': m.get('middle_name',''), 'last_name': m.get('last_name',''),
+                'dob_day': m.get('dob_day',''), 'dob_month': m.get('dob_month',''),
+                'dob_year': m.get('dob_year',''), 'email': m.get('email',''),
+                'phone': m.get('phone',''), 'house': m.get('house',''),
             })
         return _csv_response(rows, f'birthdays_{ts}.csv')
 
@@ -1892,42 +1959,158 @@ def report(kind):
         return _csv_response(rows, f'master_financial_{ts}.csv')
 
     if kind == 'executive_summary':
-        member_count = len(members)
+        mc = len(members)
         total_dues = _amt(dues_payments)
         total_contribs = _amt(contribs)
-        total_votes = len(votes)
-
-        top_c = []
-        if not contribs.empty:
-            df = contribs.copy()
-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
-            g = df.groupby(['member_name'])['amount'].sum().sort_values(ascending=False).head(10)
-            top_c = [f'{name}: GH₵{amt:.2f}' for name, amt in g.items()]
-
-        top_d = []
-        if not dues_payments.empty:
-            df = dues_payments.copy()
-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
-            g = df.groupby(['member_name'])['amount'].sum().sort_values(ascending=False).head(10)
-            top_d = [f'{name}: GH₵{amt:.2f}' for name, amt in g.items()]
-
         rows = [
-            {'metric': 'Total Members', 'value': member_count},
+            {'metric': 'Total Members', 'value': mc},
             {'metric': 'Total Dues Collected', 'value': f'GH₵{total_dues:.2f}'},
             {'metric': 'Total Contributions', 'value': f'GH₵{total_contribs:.2f}'},
-            {'metric': 'Total Money Collected', 'value': f'GH₵{total_dues + total_contribs:.2f}'},
-            {'metric': 'Total Votes Cast', 'value': total_votes},
+            {'metric': 'Total Money', 'value': f'GH₵{total_dues + total_contribs:.2f}'},
+            {'metric': 'Total Votes', 'value': len(votes)},
             {'metric': 'Total Polls', 'value': len(polls)},
             {'metric': 'Total Campaigns', 'value': len(campaigns)},
-            {'metric': 'Total Dues Periods', 'value': len(dues_plans)},
-            {'metric': 'Top 10 Contributors', 'value': ' | '.join(top_c)},
-            {'metric': 'Top 10 Dues Payers', 'value': ' | '.join(top_d)},
-            {'metric': 'Report Generated', 'value': datetime.now().isoformat()},
+            {'metric': 'Generated', 'value': datetime.now().isoformat()},
         ]
         return _csv_response(rows, f'executive_summary_{ts}.csv')
 
     flash(f'Unknown report: {kind}', 'danger')
     return redirect(url_for('admin.reports'))
+
+
+# ═══════════════════════════════════════════════════════════
+# PDF REPORT ROUTER
+# ═══════════════════════════════════════════════════════════
+@admin_bp.route('/report-pdf/<kind>')
+@_admin_required
+def report_pdf(kind):
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    members        = _load(T_MEMBERS, MEMBERS_FILE)
+    polls          = _load(T_POLLS, POLLS_FILE)
+    votes          = _load(T_VOTES, VOTES_FILE)
+    contribs       = _load(T_CONTRIBUTIONS, CONTRIBUTIONS_FILE)
+    campaigns      = _load(T_CAMPAIGNS, CAMPAIGNS_FILE)
+    dues_payments  = _load(T_DUES, DUES_FILE)
+    dues_plans     = _load(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE)
+
+    def _amt(df):
+        if df.empty or 'amount' not in df.columns:
+            return 0.0
+        return float(pd.to_numeric(df['amount'], errors='coerce').fillna(0).sum())
+
+    sections = []
+    title = 'Report'
+    subtitle = ''
+
+    if kind == 'all_members':
+        title = 'All Members'
+        subtitle = f'{len(members)} registered'
+        df = members.copy()
+        if 'password_hash' in df.columns:
+            df = df.drop(columns=['password_hash'])
+        rows = df.to_dict('records') if not df.empty else []
+        cols = ['title','first_name','middle_name','last_name','email','phone','house']
+        cols = [c for c in cols if c in (rows[0].keys() if rows else [])]
+        sections.append(('Members', rows, cols))
+
+    elif kind == 'all_campaigns':
+        title = 'Campaigns'
+        rows = []
+        mc = len(members)
+        for _, c in campaigns.iterrows():
+            cid = c['campaign_id']
+            target = float(c.get('target_amount', 0) or 0)
+            sub = contribs[contribs['campaign_id'] == cid] if not contribs.empty else pd.DataFrame()
+            raised = _amt(sub)
+            rows.append({
+                'campaign_id': cid, 'title': c['title'],
+                'target': f'{target:.2f}', 'raised': f'{raised:.2f}',
+                'funded_pct': round(raised / target * 100, 1) if target else 0,
+            })
+        sections.append(('Campaigns', rows,
+                         ['title','target','raised','funded_pct']))
+
+    elif kind == 'all_dues_plans':
+        title = 'Dues Periods'
+        rows = []
+        mc = len(members)
+        for _, d in dues_plans.iterrows():
+            did = d['dues_id']
+            amount = float(d.get('amount', 0) or 0)
+            paid = dues_payments[dues_payments['dues_id'] == did] if not dues_payments.empty else pd.DataFrame()
+            collected = _amt(paid)
+            rows.append({
+                'dues_id': did, 'month': d.get('month', ''), 'year': d.get('year', ''),
+                'amount_per_member': f'{amount:.2f}',
+                'total_collected': f'{collected:.2f}',
+                'collection_pct': round(collected / (amount * mc) * 100, 1) if mc and amount else 0,
+            })
+        sections.append(('Dues Periods', rows,
+                         ['month','year','amount_per_member','total_collected','collection_pct']))
+
+    elif kind == 'poll':
+        poll_id = request.args.get('poll_id', '')
+        p = polls[polls['poll_id'] == poll_id] if not polls.empty else pd.DataFrame()
+        if p.empty:
+            flash('Poll not found.', 'danger')
+            return redirect(url_for('admin.polls'))
+        p = p.iloc[0]
+        title = f'Poll: {p["title"]}'
+        try:
+            opts = json.loads(p.get('options_json', '[]'))
+        except Exception:
+            opts = []
+        pv = votes[votes['poll_id'] == poll_id] if not votes.empty else pd.DataFrame()
+        tally = pv['option_id'].value_counts().to_dict() if not pv.empty else {}
+        total = len(pv)
+        rows = []
+        for o in opts:
+            c = tally.get(o['id'], 0)
+            rows.append({'option_text': o['text'], 'votes': c,
+                         'pct': round(c / total * 100, 2) if total else 0})
+        sections.append(('Results', rows, ['option_text', 'votes', 'pct']))
+
+    elif kind == 'all_polls':
+        title = 'All Polls'
+        rows = []
+        mc = len(members)
+        for _, p in polls.iterrows():
+            pid = p['poll_id']
+            pv = votes[votes['poll_id'] == pid] if not votes.empty else pd.DataFrame()
+            rows.append({
+                'poll_id': pid, 'title': p['title'],
+                'total_votes': len(pv),
+                'turnout_pct': round(len(pv) / mc * 100, 1) if mc else 0,
+            })
+        sections.append(('Polls', rows,
+                         ['poll_id','title','total_votes','turnout_pct']))
+
+    elif kind == 'executive_summary':
+        title = 'Executive Summary'
+        mc = len(members)
+        total_dues = _amt(dues_payments)
+        total_contribs = _amt(contribs)
+        rows = [
+            {'metric': 'Total Members', 'value': mc},
+            {'metric': 'Total Dues Collected', 'value': f'GH₵{total_dues:.2f}'},
+            {'metric': 'Total Contributions', 'value': f'GH₵{total_contribs:.2f}'},
+            {'metric': 'Total Money Collected', 'value': f'GH₵{total_dues + total_contribs:.2f}'},
+            {'metric': 'Total Votes Cast', 'value': len(votes)},
+            {'metric': 'Total Polls', 'value': len(polls)},
+            {'metric': 'Total Campaigns', 'value': len(campaigns)},
+        ]
+        sections.append(('Summary', rows, ['metric','value']))
+
+    else:
+        flash(f'PDF not available for {kind}', 'warning')
+        return redirect(url_for('admin.reports'))
+
+    pdf_bytes = build_pdf(title, subtitle, sections)
+    return send_file(io.BytesIO(pdf_bytes),
+                     mimetype='application/pdf',
+                     as_attachment=True,
+                     download_name=f'odadea07_{kind}_{ts}.pdf')
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1948,15 +2131,11 @@ def backup():
         (T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE),
     ]
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for table_name, csv_path in tables:
-            df = _load(table_name, csv_path)
+        for table, path in tables:
+            df = _load(table, path)
             if df.empty:
                 continue
-            zf.writestr(f'{table_name}_{ts}.csv', df.to_csv(index=False))
-        zf.writestr('README.txt',
-                    f'ODADEAƐ07 Backup\n'
-                    f'Generated: {datetime.now().isoformat()}\n'
-                    f'Source: {"Supabase" if sb.SUPABASE_ENABLED else "Local CSV"}\n')
+            zf.writestr(f'{table}_{ts}.csv', df.to_csv(index=False))
     buf.seek(0)
     return send_file(buf, mimetype='application/zip',
                      as_attachment=True,
@@ -1967,16 +2146,12 @@ def backup():
 @_admin_required
 def download(kind):
     mapping = {
-        'members':       'all_members',
-        'contributions': 'all_contributions',
-        'dues':          'all_dues',
-        'votes':         'all_votes',
-        'polls':         'all_polls',
-        'campaigns':     'all_campaigns',
-        'dues_plans':    'all_dues_plans',
+        'members': 'all_members', 'contributions': 'all_contributions',
+        'dues': 'all_dues', 'votes': 'all_votes', 'polls': 'all_polls',
+        'campaigns': 'all_campaigns', 'dues_plans': 'all_dues_plans',
     }
-    new_kind = mapping.get(kind)
-    if not new_kind:
+    nk = mapping.get(kind)
+    if not nk:
         flash(f'Unknown report: {kind}', 'danger')
         return redirect(url_for('admin.reports'))
-    return redirect(url_for('admin.report', kind=new_kind))
+    return redirect(url_for('admin.report', kind=nk))

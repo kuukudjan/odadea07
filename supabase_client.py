@@ -1,29 +1,20 @@
 """
-supabase_client.py — ODADEAƐ07 Supabase helper
+supabase_client.py — ODADEAƐ07 Supabase helper (extended)
 
-Thin wrapper around the Supabase REST client. Falls back to
-local CSV files if Supabase env vars are not set, so you can
-develop locally without Supabase.
+Wrappers around the Supabase REST client. Falls back to CSV
+files if SUPABASE_URL / SUPABASE_KEY are not set.
 
 Environment variables (set these on Render):
   SUPABASE_URL — your project URL (https://xxxx.supabase.co)
   SUPABASE_KEY — your anon or service_role key
-
-─────────────────────────────────────────────────────────────
-CHANGELOG
-─────────────────────────────────────────────────────────────
-2026-09-26 — Fix: fetch_all() no longer uses .range() without
-             .order(), which caused PostgREST to return 400 and
-             made every read silently return an empty list.
-             Also logs failures to stdout so they appear in
-             Render's Logs tab.
-─────────────────────────────────────────────────────────────
 """
 
 import os
 import io
 import csv
+import json
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -59,33 +50,22 @@ def get_client():
 def fetch_all(table_name):
     """
     Return list of dicts (all rows) from a Supabase table.
-
-    Two-stage approach:
-      1. Simple select with .limit(1000) — no .range(), no .order().
-         This avoids the PostgREST bug where .range() without .order()
-         returns 400 Bad Request on newer Supabase versions.
-      2. If exactly 1000 rows came back, paginate with an explicit
-         .order() column so .range() works reliably.
+    Two-stage: simple select first; paginate only if needed.
     """
     client = get_client()
     if client is None:
         return []
     try:
-        # ── Stage 1: simple select. No .range() → no bug. ──
         resp = client.table(table_name).select('*').limit(1000).execute()
         first_page = resp.data or []
 
         if len(first_page) < 1000:
-            # We have everything in one page.
             return first_page
 
-        # ── Stage 2: more than 1000 rows. Paginate with an order column. ──
         all_rows = list(first_page)
-
-        # Pick an order column that exists. Most tables have one of these.
         sample = first_page[0] if first_page else {}
         order_col = None
-        for candidate in ('created_at', 'registered_at', 'voted_at'):
+        for candidate in ('created_at', 'registered_at', 'voted_at', 'happened_at'):
             if candidate in sample:
                 order_col = candidate
                 break
@@ -103,19 +83,13 @@ def fetch_all(table_name):
                 break
             offset += page_size
         return all_rows
-
     except Exception as e:
-        # Print to stdout so it shows up in Render logs
         print(f'[Supabase fetch failed for {table_name}]: {e}')
         logger.error(f'Supabase fetch failed for {table_name}: {e}')
         return []
 
 
 def fetch_one(table_name, id_col, id_val):
-    """
-    Fetch a single row by matching id_col == id_val.
-    Returns dict or None.
-    """
     client = get_client()
     if client is None:
         return None
@@ -129,7 +103,6 @@ def fetch_one(table_name, id_col, id_val):
         return rows[0] if rows else None
     except Exception as e:
         print(f'[Supabase fetch_one failed for {table_name}]: {e}')
-        logger.error(f'Supabase fetch_one failed for {table_name}: {e}')
         return None
 
 
@@ -137,10 +110,6 @@ def fetch_one(table_name, id_col, id_val):
 # WRITE
 # ═══════════════════════════════════════════════════════════
 def insert_row(table_name, row):
-    """
-    Insert a single row. Returns True on success, False on failure.
-    Failures print to stdout so they appear in Render logs.
-    """
     client = get_client()
     if client is None:
         return False
@@ -154,7 +123,6 @@ def insert_row(table_name, row):
 
 
 def delete_where(table_name, col, val):
-    """Delete rows where col == val. Returns True if the call succeeded."""
     client = get_client()
     if client is None:
         return False
@@ -163,12 +131,10 @@ def delete_where(table_name, col, val):
         return True
     except Exception as e:
         print(f'[Supabase delete failed for {table_name}]: {e}')
-        logger.error(f'Supabase delete failed for {table_name}: {e}')
         return False
 
 
 def update_where(table_name, id_col, id_val, updates):
-    """Update rows where id_col == id_val with the given dict."""
     client = get_client()
     if client is None:
         return False
@@ -177,15 +143,26 @@ def update_where(table_name, id_col, id_val, updates):
         return True
     except Exception as e:
         print(f'[Supabase update failed for {table_name}]: {e}')
-        logger.error(f'Supabase update failed for {table_name}: {e}')
+        return False
+
+
+def upsert_row(table_name, row, on_conflict):
+    """Insert or update based on a unique column."""
+    client = get_client()
+    if client is None:
+        return False
+    try:
+        client.table(table_name).upsert(row, on_conflict=on_conflict).execute()
+        return True
+    except Exception as e:
+        print(f'[Supabase upsert failed for {table_name}]: {e}')
         return False
 
 
 # ═══════════════════════════════════════════════════════════
-# CSV HELPERS (used by reports)
+# CSV HELPERS
 # ═══════════════════════════════════════════════════════════
 def rows_to_csv_bytes(rows):
-    """Convert a list of dicts to UTF-8 CSV bytes."""
     if not rows:
         return b''
     buf = io.StringIO()
@@ -197,18 +174,55 @@ def rows_to_csv_bytes(rows):
 
 
 def fetch_table_csv(table_name):
-    """Fetch a whole table and return CSV bytes."""
     return rows_to_csv_bytes(fetch_all(table_name))
+
+
+# ═══════════════════════════════════════════════════════════
+# RATE LIMIT (persistent — replaces the in-memory version)
+# ═══════════════════════════════════════════════════════════
+def rate_limit_get(key):
+    """Return the stored attempts list for a key, or []."""
+    row = fetch_one('rate_limit', 'key', key)
+    if not row:
+        return []
+    try:
+        return json.loads(row.get('attempts', '[]'))
+    except Exception:
+        return []
+
+
+def rate_limit_set(key, attempts):
+    """Store attempts list for a key."""
+    row = {
+        'key': key,
+        'attempts': json.dumps(attempts),
+        'updated_at': datetime.now().isoformat(),
+    }
+    return upsert_row('rate_limit', row, 'key')
+
+
+# ═══════════════════════════════════════════════════════════
+# LOGIN HISTORY
+# ═══════════════════════════════════════════════════════════
+def log_login(subject_type, subject_id, ip, user_agent, success):
+    """Append a login attempt to login_history."""
+    import time, random
+    entry = {
+        'entry_id': f"LOG{int(time.time())}{random.randint(100,999)}",
+        'subject_type': subject_type,
+        'subject_id': subject_id or '',
+        'ip_address': ip or '',
+        'user_agent': (user_agent or '')[:300],
+        'success': 'True' if success else 'False',
+        'happened_at': datetime.now().isoformat(),
+    }
+    return insert_row('login_history', entry)
 
 
 # ═══════════════════════════════════════════════════════════
 # FILTER HELPER
 # ═══════════════════════════════════════════════════════════
 def filter_rows(rows, **filters):
-    """
-    Filter rows client-side. Each filter is (field, value).
-    Value comparison is case-insensitive string match.
-    """
     out = rows
     for field, value in filters.items():
         if value in (None, '', 'all', 'ALL'):
