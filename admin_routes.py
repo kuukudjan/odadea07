@@ -1,17 +1,11 @@
 """
-admin_routes.py — ODADEAƐ07 Admin Panel (extended)
+admin_routes.py — ODADEAƐ07 Admin Panel
 
-New features:
-  • Poll scheduling (open_at, close_at, anonymous)
-  • Member roles (member / treasurer / secretary / admin)
-  • Member suspension
-  • Bulk actions (select many, delete)
-  • CSV import for members
-  • Search in members list
-  • Date filters in reports
-  • PDF report downloads
-  • Per-admin accounts
-  • Login history view
+Role system:
+  • Roles are stored in the Supabase `roles` table.
+  • Admin can create, edit, delete, and deactivate roles at /admin/roles.
+  • Every member role dropdown across the panel reads from this table.
+  • Fallback to a built-in default list if the table is empty.
 """
 
 import os
@@ -23,7 +17,6 @@ import random
 import zipfile
 from datetime import datetime, timedelta
 from functools import wraps
-from collections import defaultdict
 from io import BytesIO
 
 import pandas as pd
@@ -37,6 +30,9 @@ import two_factor as tf
 from chart_helpers import bar_chart, line_chart, CHART_JS_CDN
 from pdf_helpers import build_pdf
 
+# ─────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────
 BASE_DIR            = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR            = os.environ.get('DATA_DIR', os.path.join(BASE_DIR, 'data'))
 MEMBERS_FILE        = os.path.join(DATA_DIR, 'members.csv')
@@ -46,10 +42,11 @@ CONTRIBUTIONS_FILE  = os.path.join(DATA_DIR, 'contributions.csv')
 CAMPAIGNS_FILE      = os.path.join(DATA_DIR, 'contributions_campaigns.csv')
 DUES_FILE           = os.path.join(DATA_DIR, 'dues.csv')
 DUES_CAMPAIGNS_FILE = os.path.join(DATA_DIR, 'dues_campaigns.csv')
+ROLES_FILE          = os.path.join(DATA_DIR, 'roles.csv')
+ADMIN_USERS_FILE    = os.path.join(DATA_DIR, 'admin_users.csv')
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Legacy shared password — still supported for backward compatibility
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'CHANGE-ME-NOW')
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
@@ -63,15 +60,23 @@ T_DUES           = 'dues'
 T_DUES_CAMPAIGNS = 'dues_campaigns'
 T_ADMIN_USERS    = 'admin_users'
 T_LOGIN_HISTORY  = 'login_history'
+T_ROLES          = 'roles'
 
 MONTHS = ['January','February','March','April','May','June',
           'July','August','September','October','November','December']
 TITLES = ['Mr','Mrs','Miss','Dr','Rev','Prof','Hon','Nana','Nii']
-ROLES  = ['admin','treasurer','secretary','member']
+
+# Fallback roles — used only if the roles table is empty
+DEFAULT_ROLES = [
+    {'role_id': 'ROLE_admin',     'name': 'Admin',     'color': '#ed1c24', 'description': 'Full control'},
+    {'role_id': 'ROLE_treasurer', 'name': 'Treasurer', 'color': '#1a3fbf', 'description': 'Manages money'},
+    {'role_id': 'ROLE_secretary', 'name': 'Secretary', 'color': '#0ea5e9', 'description': 'Records'},
+    {'role_id': 'ROLE_member',    'name': 'Member',    'color': '#6c757d', 'description': 'Regular member'},
+]
 
 
 # ─────────────────────────────────────────────────────────
-# RATE LIMITER (persistent)
+# RATE LIMITER
 # ─────────────────────────────────────────────────────────
 _WINDOW = timedelta(minutes=15)
 _MAX    = 5
@@ -232,6 +237,33 @@ def _admin_required(f):
 
 
 # ─────────────────────────────────────────────────────────
+# ROLE HELPERS
+# ─────────────────────────────────────────────────────────
+def _load_roles():
+    """Return list of active roles. Falls back to defaults if empty."""
+    df = _load(T_ROLES, ROLES_FILE)
+    if df.empty:
+        return list(DEFAULT_ROLES)
+    # Sort: Admin first, then alphabetical
+    def _sort_key(r):
+        name = (r.get('name') or '').lower()
+        return (0 if name == 'admin' else 1, name)
+    rows = [r for r in df.to_dict('records') if str(r.get('active', 'True')).lower() in ['true', '1', 'yes']]
+    return sorted(rows, key=_sort_key)
+
+
+def _role_names():
+    return [r['name'] for r in _load_roles()]
+
+
+def _role_color(name):
+    for r in _load_roles():
+        if (r.get('name') or '').lower() == (name or '').lower():
+            return r.get('color') or '#6c757d'
+    return '#6c757d'
+
+
+# ─────────────────────────────────────────────────────────
 # LAYOUT
 # ─────────────────────────────────────────────────────────
 ADMIN_LAYOUT = r"""<!DOCTYPE html>
@@ -262,6 +294,7 @@ ADMIN_LAYOUT = r"""<!DOCTYPE html>
                 <a href="{{ url_for('admin.contrib') }}">🎯 Contributions</a>
                 <a href="{{ url_for('admin.dues') }}">📅 Dues</a>
                 <a href="{{ url_for('admin.members') }}">👥 Members</a>
+                <a href="{{ url_for('admin.roles') }}">🎭 Roles</a>
                 <a href="{{ url_for('admin.admin_users') }}">🔐 Admins</a>
                 <a href="{{ url_for('admin.reports') }}">📈 Reports</a>
                 <a href="{{ url_for('admin.logout') }}" class="btn-register">Logout</a>
@@ -303,7 +336,7 @@ def _page(body):
 
 
 # ─────────────────────────────────────────────────────────
-# LOGIN / LOGOUT (individual + legacy password)
+# LOGIN / LOGOUT
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/login', methods=['GET', 'POST'])
 def login():
@@ -317,15 +350,13 @@ def login():
         email = _sanitize(request.form.get('email', ''), 120).lower()
         pwd   = request.form.get('password', '')
 
-        # Try individual admin account first
-        admins = _load(T_ADMIN_USERS, os.path.join(DATA_DIR, 'admin_users.csv'))
+        admins = _load(T_ADMIN_USERS, ADMIN_USERS_FILE)
         if email and not admins.empty:
             row = admins[admins['email'].str.lower() == email]
             if not row.empty:
                 stored = row.iloc[0].get('password_hash', '')
                 try:
                     if check_password_hash(stored, pwd):
-                        # Check 2FA
                         if str(row.iloc[0].get('totp_enabled', 'False')).lower() == 'true':
                             session['pending_admin_id'] = row.iloc[0]['admin_id']
                             return redirect(url_for('admin.login_2fa'))
@@ -334,8 +365,7 @@ def login():
                         session['admin_email'] = email
                         session['is_admin'] = True
                         session.permanent = True
-                        _update_where(T_ADMIN_USERS,
-                                      os.path.join(DATA_DIR, 'admin_users.csv'),
+                        _update_where(T_ADMIN_USERS, ADMIN_USERS_FILE,
                                       'admin_id', row.iloc[0]['admin_id'],
                                       {'last_login': datetime.now().isoformat()})
                         sb.log_login('admin', row.iloc[0]['admin_id'], ip,
@@ -345,19 +375,16 @@ def login():
                 except Exception:
                     pass
 
-        # Fall back to legacy shared password
         if pwd == ADMIN_PASSWORD:
             _rate_clear('admin-login', ip)
             session['is_admin'] = True
             session.permanent = True
-            sb.log_login('admin', None, ip,
-                         request.headers.get('User-Agent', ''), True)
+            sb.log_login('admin', None, ip, request.headers.get('User-Agent', ''), True)
             flash('Welcome, admin.', 'success')
             return redirect(url_for('admin.home'))
 
         _rate_record(key, attempts)
-        sb.log_login('admin', None, ip,
-                     request.headers.get('User-Agent', ''), False)
+        sb.log_login('admin', None, ip, request.headers.get('User-Agent', ''), False)
         remaining = _MAX - (len(attempts) + 1)
         flash(f'Invalid credentials. {max(remaining, 0)} attempts left.', 'danger')
 
@@ -373,9 +400,7 @@ def login():
           <input type="password" name="password" required></div>
         <button class="btn btn-primary btn-full">🔓 Enter</button>
       </form>
-      <p class="form-footer">
-        <a href="{{ url_for('index') }}">← Back to site</a>
-      </p>
+      <p class="form-footer"><a href="{{ url_for('index') }}">← Back to site</a></p>
     </div>
     """)
     return _page(body)
@@ -421,7 +446,7 @@ def logout():
 
 
 # ─────────────────────────────────────────────────────────
-# DASHBOARD (with charts)
+# DASHBOARD
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/')
 @_admin_required
@@ -449,7 +474,6 @@ def home():
         'dues_plans': len(duesc),
     }
 
-    # Charts
     dues_chart = ''
     if not dues.empty:
         df = dues.copy()
@@ -459,12 +483,14 @@ def home():
         dues_chart = line_chart('dues-monthly',
                                 list(g.index), [float(v) for v in g.values])
 
-    member_status_chart = ''
-    if not members.empty and 'status' in members.columns:
-        counts = members['status'].replace('', 'active').value_counts()
-        member_status_chart = bar_chart('member-status',
-                                        list(counts.index),
-                                        [int(v) for v in counts.values])
+    roles_chart = ''
+    if not members.empty and 'role' in members.columns:
+        counts = members['role'].replace('', 'Member').value_counts()
+        colors = [_role_color(name) for name in counts.index]
+        roles_chart = bar_chart('roles-chart',
+                                list(counts.index),
+                                [int(v) for v in counts.values],
+                                colors=colors)
 
     body = render_template_string("""
     <div class="reports-header">
@@ -504,10 +530,10 @@ def home():
     </div>
     {% endif %}
 
-    {% if member_status_chart %}
+    {% if roles_chart %}
     <div class="report-section">
-      <h2>👥 Members by status</h2>
-      {{ member_status_chart|safe }}
+      <h2>🎭 Members by role</h2>
+      {{ roles_chart|safe }}
     </div>
     {% endif %}
 
@@ -516,17 +542,162 @@ def home():
       <a href="{{ url_for('admin.contrib') }}" class="btn btn-primary">🎯 Contributions</a>
       <a href="{{ url_for('admin.dues') }}"    class="btn btn-primary">📅 Dues</a>
       <a href="{{ url_for('admin.members') }}" class="btn btn-primary">👥 Members</a>
+      <a href="{{ url_for('admin.roles') }}"   class="btn btn-primary">🎭 Roles</a>
       <a href="{{ url_for('admin.admin_users') }}" class="btn btn-secondary">🔐 Admin Users</a>
       <a href="{{ url_for('admin.login_history') }}" class="btn btn-secondary">🔐 Login History</a>
       <a href="{{ url_for('admin.reports') }}" class="btn btn-secondary">📈 Reports</a>
       <a href="{{ url_for('admin.backup') }}"  class="btn btn-secondary">💾 Backup (ZIP)</a>
     </div>
-    """, s=stats, dues_chart=dues_chart, member_status_chart=member_status_chart)
+    """, s=stats, dues_chart=dues_chart, roles_chart=roles_chart)
     return _page(body)
 
 
 # ─────────────────────────────────────────────────────────
-# POLLS (scheduling + anonymous + unlimited options)
+# ROLES (add / edit / delete)
+# ─────────────────────────────────────────────────────────
+@admin_bp.route('/roles', methods=['GET', 'POST'])
+@_admin_required
+def roles():
+    if request.method == 'POST':
+        action = request.form.get('action', 'add')
+
+        if action == 'add':
+            name = _sanitize(request.form.get('name', ''), 60)
+            desc = _sanitize(request.form.get('description', ''), 200)
+            color = _sanitize(request.form.get('color', '#1a3fbf'), 20)
+            if not name:
+                flash('Role name is required.', 'danger')
+                return redirect(url_for('admin.roles'))
+
+            existing = _load(T_ROLES, ROLES_FILE)
+            if not existing.empty and name.lower() in existing['name'].str.lower().values:
+                flash('That role already exists.', 'warning')
+                return redirect(url_for('admin.roles'))
+
+            _insert(T_ROLES, ROLES_FILE, {
+                'role_id':     f"ROLE_{int(time.time())}_{random.randint(100,999)}",
+                'name':        name,
+                'description': desc,
+                'color':       color,
+                'created_at':  datetime.now().isoformat(),
+                'active':      'True',
+            })
+            flash(f'✅ Role "{name}" created.', 'success')
+
+        elif action == 'edit':
+            rid = request.form.get('role_id')
+            updates = {
+                'name':        _sanitize(request.form.get('name', ''), 60),
+                'description': _sanitize(request.form.get('description', ''), 200),
+                'color':       _sanitize(request.form.get('color', '#1a3fbf'), 20),
+                'active':      _sanitize(request.form.get('active', 'True'), 10),
+            }
+            if rid and _update_where(T_ROLES, ROLES_FILE, 'role_id', rid, updates):
+                flash('Role updated.', 'success')
+
+        elif action == 'delete':
+            rid = request.form.get('role_id')
+            if rid and _delete_where(T_ROLES, ROLES_FILE, 'role_id', rid):
+                flash('Role deleted.', 'success')
+
+        return redirect(url_for('admin.roles'))
+
+    roles_list = _load_roles()
+    # Count members per role
+    members = _load(T_MEMBERS, MEMBERS_FILE)
+    counts = {}
+    if not members.empty and 'role' in members.columns:
+        counts = members['role'].replace('', 'Member').value_counts().to_dict()
+
+    body = render_template_string("""
+    <div class="reports-header">
+      <div><h1>🎭 Roles</h1>
+      <p class="subtitle">{{ roles|length }} role(s) defined</p></div>
+      <div class="report-actions">
+        <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
+      </div>
+    </div>
+
+    <div class="form-container">
+      <h1>➕ Create a new role</h1>
+      <p class="form-subtitle">Give it a name and pick a colour</p>
+      <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="add">
+        <div class="form-row">
+          <div class="form-group"><label>Name *</label>
+            <input name="name" required maxlength="60" placeholder="e.g. PRO, Organizer, Welfare Officer"></div>
+          <div class="form-group"><label>Colour</label>
+            <input type="color" name="color" value="#1a3fbf"
+                   style="width:100%;height:48px;padding:4px;cursor:pointer;"></div>
+        </div>
+        <div class="form-group"><label>Description</label>
+          <input name="description" maxlength="200" placeholder="What does this role do?"></div>
+        <button class="btn btn-primary btn-full">Create Role</button>
+      </form>
+    </div>
+
+    <div class="table-wrapper">
+      <table class="report-table full-width">
+        <thead><tr>
+          <th>Colour</th><th>Name</th><th>Description</th>
+          <th>Members with this role</th><th>Status</th><th>Actions</th>
+        </tr></thead>
+        <tbody>
+        {% for r in roles %}
+          <tr>
+            <td><span style="display:inline-block;width:20px;height:20px;
+                border-radius:50%;background:{{ r.color }};"></span></td>
+            <td><strong>{{ r.name }}</strong></td>
+            <td>{{ r.description or '—' }}</td>
+            <td>{{ counts.get(r.name, 0) }}</td>
+            <td>
+              <span class="status-badge {{ 'status-active' if r.active|lower in ['true','1','yes'] else 'status-closed' }}">
+                {{ 'Active' if r.active|lower in ['true','1','yes'] else 'Inactive' }}
+              </span>
+            </td>
+            <td>
+              <details>
+                <summary style="cursor:pointer;color:var(--presec-blue);font-weight:700;">Edit</summary>
+                <form method="POST" style="margin-top:0.5rem;">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="action" value="edit">
+                  <input type="hidden" name="role_id" value="{{ r.role_id }}">
+                  <div class="form-group"><label>Name</label>
+                    <input name="name" value="{{ r.name }}" maxlength="60"></div>
+                  <div class="form-group"><label>Description</label>
+                    <input name="description" value="{{ r.description }}" maxlength="200"></div>
+                  <div class="form-group"><label>Colour</label>
+                    <input type="color" name="color" value="{{ r.color }}"></div>
+                  <div class="form-group"><label>Status</label>
+                    <select name="active">
+                      <option value="True" {% if r.active|lower in ['true','1','yes'] %}selected{% endif %}>Active</option>
+                      <option value="False" {% if r.active|lower not in ['true','1','yes'] %}selected{% endif %}>Inactive</option>
+                    </select></div>
+                  <button class="btn btn-small btn-primary">Save</button>
+                </form>
+                <form method="POST" style="margin-top:0.5rem;"
+                      onsubmit="return confirm('Delete this role? Members with this role will keep it as text.');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="action" value="delete">
+                  <input type="hidden" name="role_id" value="{{ r.role_id }}">
+                  <button class="btn btn-small btn-primary">🗑️ Delete</button>
+                </form>
+              </details>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="empty-state">No roles defined yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    """, roles=roles_list, counts=counts)
+    return _page(body)
+
+
+# ─────────────────────────────────────────────────────────
+# POLLS
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/polls', methods=['GET', 'POST'])
 @_admin_required
@@ -588,7 +759,6 @@ def polls():
     votes_df = _load(T_VOTES, VOTES_FILE)
     member_count = len(_load(T_MEMBERS, MEMBERS_FILE))
 
-    # Date filter
     from_date = _sanitize(request.args.get('from', ''), 10)
     to_date   = _sanitize(request.args.get('to', ''), 10)
 
@@ -632,8 +802,8 @@ def polls():
     <div class="reports-header">
       <div><h1>🗳️ Polls</h1><p class="subtitle">{{ reports|length }}</p></div>
       <div class="report-actions">
-        <a href="{{ url_for('admin.report', kind='all_polls') }}" class="btn btn-secondary">⬇ All Polls</a>
-        <a href="{{ url_for('admin.report', kind='all_votes') }}" class="btn btn-secondary">⬇ Votes</a>
+        <a href="{{ url_for('admin.report', kind='all_polls') }}" class="btn btn-secondary">⬇ CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='all_polls') }}" class="btn btn-secondary">⬇ PDF</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
@@ -665,14 +835,14 @@ def polls():
           <label>Options * (minimum 2)</label>
           <div id="options-wrapper">
             <div style="display:flex;gap:8px;margin-bottom:8px;" class="option-row">
-              <input type="text" name="option_0" required maxlength="120"
-                     placeholder="Option 1" style="flex:1;padding:12px;border:2px solid #e3e7ee;border-radius:10px;">
+              <input type="text" name="option_0" required maxlength="120" placeholder="Option 1"
+                     style="flex:1;padding:12px;border:2px solid #e3e7ee;border-radius:10px;">
               <button type="button" class="option-remove-btn" disabled
                       style="width:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;opacity:0.35;">✕</button>
             </div>
             <div style="display:flex;gap:8px;margin-bottom:8px;" class="option-row">
-              <input type="text" name="option_1" required maxlength="120"
-                     placeholder="Option 2" style="flex:1;padding:12px;border:2px solid #e3e7ee;border-radius:10px;">
+              <input type="text" name="option_1" required maxlength="120" placeholder="Option 2"
+                     style="flex:1;padding:12px;border:2px solid #e3e7ee;border-radius:10px;">
               <button type="button" class="option-remove-btn" disabled
                       style="width:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;opacity:0.35;">✕</button>
             </div>
@@ -739,8 +909,8 @@ def polls():
       {% endfor %}
 
       <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:1rem;padding-top:1rem;border-top:1px dashed #e3e7ee;">
-        <a href="{{ url_for('admin.report', kind='poll', poll_id=p.id) }}" class="btn btn-small btn-primary">⬇ Report CSV</a>
-        <a href="{{ url_for('admin.report_pdf', kind='poll', poll_id=p.id) }}" class="btn btn-small btn-secondary">⬇ Report PDF</a>
+        <a href="{{ url_for('admin.report', kind='poll', poll_id=p.id) }}" class="btn btn-small btn-primary">⬇ CSV</a>
+        <a href="{{ url_for('admin.report_pdf', kind='poll', poll_id=p.id) }}" class="btn btn-small btn-secondary">⬇ PDF</a>
         <form method="POST" style="display:inline;">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="action" value="toggle">
@@ -1060,11 +1230,14 @@ def dues():
 
 
 # ─────────────────────────────────────────────────────────
-# MEMBERS (with search, bulk actions, roles, suspension, CSV import)
+# MEMBERS (dropdown of roles now comes from the roles table)
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/members', methods=['GET', 'POST'])
 @_admin_required
 def members():
+    roles_list = _load_roles()
+    role_names = [r['name'] for r in roles_list]
+
     if request.method == 'POST':
         action = request.form.get('action', 'add')
 
@@ -1073,8 +1246,8 @@ def members():
             middle_name = _sanitize(request.form.get('middle_name', ''), 120)
             last_name   = _sanitize(request.form.get('last_name', ''), 120)
             email       = _sanitize(request.form.get('email', ''), 120).lower()
+            role        = _sanitize(request.form.get('role', ''), 60) or 'Member'
             if first_name and last_name and email:
-                from werkzeug.security import generate_password_hash
                 full_name = _build_full_name(first_name, middle_name, last_name)
                 _insert(T_MEMBERS, MEMBERS_FILE, {
                     'member_id':         f"MEM{int(time.time())}{random.randint(100,999)}",
@@ -1095,7 +1268,7 @@ def members():
                     'password_hash':     generate_password_hash('changeme123'),
                     'registered_at':     datetime.now().isoformat(),
                     'status':            'active',
-                    'role':              'member',
+                    'role':              role,
                     'totp_secret':       '',
                     'totp_enabled':      'False',
                 })
@@ -1122,7 +1295,7 @@ def members():
                 'job_title':         _sanitize(request.form.get('job_title', ''), 120),
                 'industry':          _sanitize(request.form.get('industry', ''), 120),
                 'status':            _sanitize(request.form.get('status', 'active'), 20),
-                'role':              _sanitize(request.form.get('role', 'member'), 20),
+                'role':              _sanitize(request.form.get('role', ''), 60) or 'Member',
             }
             if mid and _update_where(T_MEMBERS, MEMBERS_FILE, 'member_id', mid, updates):
                 flash('Member updated.', 'success')
@@ -1148,7 +1321,6 @@ def members():
             try:
                 df = pd.read_csv(f, dtype=str).fillna('')
                 added = 0
-                from werkzeug.security import generate_password_hash
                 for _, row in df.iterrows():
                     email = str(row.get('email', '')).strip().lower()
                     if not email or '@' not in email:
@@ -1181,7 +1353,7 @@ def members():
                             str(row.get('password', '') or 'changeme123')),
                         'registered_at':     datetime.now().isoformat(),
                         'status':            'active',
-                        'role':              'member',
+                        'role':              str(row.get('role', '') or 'Member').strip(),
                         'totp_secret':       '',
                         'totp_enabled':      'False',
                     })
@@ -1209,6 +1381,7 @@ def members():
       <div class="report-actions">
         <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-secondary">⬇ CSV</a>
         <a href="{{ url_for('admin.report_pdf', kind='all_members') }}" class="btn btn-secondary">⬇ PDF</a>
+        <a href="{{ url_for('admin.roles') }}" class="btn btn-secondary">🎭 Manage Roles</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
@@ -1227,7 +1400,7 @@ def members():
       <h3>📥 Bulk Import (CSV)</h3>
       <p class="form-subtitle">
         Columns: first_name, last_name, middle_name, email, phone, house,
-        dob_day, dob_month, dob_year, emergency_contact, job_title, industry
+        dob_day, dob_month, dob_year, emergency_contact, job_title, industry, role
       </p>
       <form method="POST" enctype="multipart/form-data">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1260,6 +1433,12 @@ def members():
           <div class="form-group"><label>House</label>
             <input name="house"></div>
         </div>
+        <div class="form-group"><label>Role</label>
+          <select name="role">
+            {% for r in role_names %}
+              <option value="{{ r }}" {% if r == 'Member' %}selected{% endif %}>{{ r }}</option>
+            {% endfor %}
+          </select></div>
         <button class="btn btn-primary btn-full">Add</button>
       </form>
     </div>
@@ -1281,7 +1460,13 @@ def members():
               <td><strong>{{ m.get('title','') }} {{ m.get('first_name') or m.get('full_name','') }} {{ m.get('last_name','') }}</strong></td>
               <td>{{ m.get('email','') }}</td>
               <td>{{ m.get('house','') or '—' }}</td>
-              <td>{{ m.get('role','member') }}</td>
+              <td>
+                <span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:999px;
+                  font-size:0.75rem;font-weight:700;color:#fff;
+                  background:{{ role_colors.get(m.get('role','') or 'Member', '#6c757d') }};">
+                  {{ m.get('role','Member') }}
+                </span>
+              </td>
               <td>{{ m.get('status','active') }}</td>
               <td>
                 <details>
@@ -1309,8 +1494,8 @@ def members():
                       </select></div>
                     <div class="form-group"><label>Role</label>
                       <select name="role">
-                        {% for r in ['member','treasurer','secretary','admin'] %}
-                        <option {% if m.get('role','member')==r %}selected{% endif %}>{{ r }}</option>
+                        {% for r in role_names %}
+                        <option {% if m.get('role','Member')==r %}selected{% endif %}>{{ r }}</option>
                         {% endfor %}
                       </select></div>
                     <button class="btn btn-small btn-primary">Save</button>
@@ -1339,32 +1524,36 @@ def members():
     </form>
 
     <script>
-      document.getElementById('check-all').addEventListener('change', function(e){
-        document.querySelectorAll('input[name="member_ids"]').forEach(function(c){
-          c.checked = e.target.checked;
+      var cb = document.getElementById('check-all');
+      if (cb) {
+        cb.addEventListener('change', function(e){
+          document.querySelectorAll('input[name="member_ids"]').forEach(function(c){
+            c.checked = e.target.checked;
+          });
         });
-      });
+      }
     </script>
-    """, rows=rows, q=q)
+    """, rows=rows, q=q, role_names=role_names,
+         role_colors={r['name']: r.get('color', '#6c757d') for r in roles_list})
     return _page(body)
 
 
 # ─────────────────────────────────────────────────────────
-# ADMIN USERS (individual accounts + 2FA)
+# ADMIN USERS (role dropdown also uses dynamic roles)
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/admin-users', methods=['GET', 'POST'])
 @_admin_required
 def admin_users():
-    csv_path = os.path.join(DATA_DIR, 'admin_users.csv')
+    role_names = _role_names()
     if request.method == 'POST':
         action = request.form.get('action')
         if action == 'add':
             email = _sanitize(request.form.get('email', ''), 120).lower()
             name  = _sanitize(request.form.get('full_name', ''), 120)
             pwd   = request.form.get('password', '')
-            role  = _sanitize(request.form.get('role', 'admin'), 20)
+            role  = _sanitize(request.form.get('role', 'Admin'), 60) or 'Admin'
             if email and len(pwd) >= 8:
-                _insert(T_ADMIN_USERS, csv_path, {
+                _insert(T_ADMIN_USERS, ADMIN_USERS_FILE, {
                     'admin_id': f"ADM{int(time.time())}{random.randint(100,999)}",
                     'email': email,
                     'full_name': name,
@@ -1379,11 +1568,11 @@ def admin_users():
                 flash(f'Admin added: {email}', 'success')
         elif action == 'delete':
             aid = request.form.get('admin_id')
-            if aid and _delete_where(T_ADMIN_USERS, csv_path, 'admin_id', aid):
+            if aid and _delete_where(T_ADMIN_USERS, ADMIN_USERS_FILE, 'admin_id', aid):
                 flash('Admin removed.', 'success')
         return redirect(url_for('admin.admin_users'))
 
-    df = _load(T_ADMIN_USERS, csv_path)
+    df = _load(T_ADMIN_USERS, ADMIN_USERS_FILE)
     rows = df.to_dict('records') if not df.empty else []
     for r in rows:
         r.pop('password_hash', None)
@@ -1393,6 +1582,7 @@ def admin_users():
     <div class="reports-header">
       <div><h1>🔐 Admin Accounts</h1></div>
       <div class="report-actions">
+        <a href="{{ url_for('admin.roles') }}" class="btn btn-secondary">🎭 Manage Roles</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
@@ -1414,9 +1604,7 @@ def admin_users():
             <input type="password" name="password" required minlength="8"></div>
           <div class="form-group"><label>Role</label>
             <select name="role">
-              <option value="admin">admin</option>
-              <option value="treasurer">treasurer</option>
-              <option value="secretary">secretary</option>
+              {% for r in role_names %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
             </select></div>
         </div>
         <button class="btn btn-primary btn-full">Add Admin</button>
@@ -1434,7 +1622,7 @@ def admin_users():
         <tr>
           <td><strong>{{ r.get('full_name','') }}</strong></td>
           <td>{{ r.get('email','') }}</td>
-          <td>{{ r.get('role','admin') }}</td>
+          <td>{{ r.get('role','Admin') }}</td>
           <td>{{ r.get('last_login','')[:19] or 'Never' }}</td>
           <td>
             <form method="POST" onsubmit="return confirm('Remove this admin?');">
@@ -1451,28 +1639,26 @@ def admin_users():
         </tbody>
       </table>
     </div>
-    """, rows=rows)
+    """, rows=rows, role_names=role_names)
     return _page(body)
 
 
 # ─────────────────────────────────────────────────────────
-# LOGIN HISTORY (admin view)
+# LOGIN HISTORY
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/login-history')
 @_admin_required
 def login_history():
     rows = sb.fetch_all(T_LOGIN_HISTORY)[-500:]
     rows = list(reversed(rows))
-
     body = render_template_string("""
     <div class="reports-header">
       <div><h1>🔐 Login History</h1>
-      <p class="subtitle">Last 500 events (all accounts)</p></div>
+      <p class="subtitle">Last 500 events</p></div>
       <div class="report-actions">
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
       </div>
     </div>
-
     <div class="table-wrapper">
       <table class="report-table full-width">
         <thead><tr>
@@ -1500,7 +1686,7 @@ def login_history():
 
 
 # ═══════════════════════════════════════════════════════════
-# REPORTS HUB (with PDF buttons)
+# REPORTS HUB
 # ═══════════════════════════════════════════════════════════
 @admin_bp.route('/reports')
 @_admin_required
@@ -1518,7 +1704,7 @@ def reports():
 
     body = render_template_string("""
     <div class="reports-header">
-      <div><h1>📈 Reports</h1><p class="subtitle">CSV and PDF downloads</p></div>
+      <div><h1>📈 Reports</h1><p class="subtitle">CSV and PDF</p></div>
       <div class="report-actions">
         <a href="{{ url_for('admin.backup') }}" class="btn btn-primary">💾 Full Backup</a>
         <a href="{{ url_for('admin.home') }}" class="btn btn-secondary">← Dashboard</a>
@@ -1593,6 +1779,8 @@ def reports():
           <a href="{{ url_for('admin.report', kind='members_full_profile') }}" class="btn btn-primary">⬇ CSV</a></div>
         <div class="report-card"><h3>By House</h3>
           <a href="{{ url_for('admin.report', kind='members_by_house') }}" class="btn btn-primary">⬇ CSV</a></div>
+        <div class="report-card"><h3>By Role</h3>
+          <a href="{{ url_for('admin.report', kind='members_by_role') }}" class="btn btn-primary">⬇ CSV</a></div>
         <div class="report-card"><h3>By Industry</h3>
           <a href="{{ url_for('admin.report', kind='members_by_industry') }}" class="btn btn-primary">⬇ CSV</a></div>
         <div class="report-card"><h3>By Job Title</h3>
@@ -1645,22 +1833,13 @@ def report(kind):
     dues_payments  = _load(T_DUES, DUES_FILE)
     dues_plans     = _load(T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE)
 
-    from_date = _sanitize(request.args.get('from', ''), 10)
-    to_date   = _sanitize(request.args.get('to', ''), 10)
-
     def _amt(df, col='amount'):
         if df.empty or col not in df.columns:
             return 0.0
         return float(pd.to_numeric(df[col], errors='coerce').fillna(0).sum())
 
     def _records(df):
-        if df.empty:
-            return []
-        if from_date and 'created_at' in df.columns:
-            df = df[df['created_at'].str[:10] >= from_date]
-        if to_date and 'created_at' in df.columns:
-            df = df[df['created_at'].str[:10] <= to_date]
-        return df.to_dict('records')
+        return df.to_dict('records') if not df.empty else []
 
     if kind == 'all_polls':
         rows = []
@@ -1764,7 +1943,6 @@ def report(kind):
         return _csv_response(_records(dues_payments), f'all_dues_{ts}.csv')
 
     if kind == 'outstanding_dues':
-        mc = len(members)
         rows = []
         for _, d in dues_plans.iterrows():
             did = d['dues_id']
@@ -1871,6 +2049,17 @@ def report(kind):
             rows.append({'house': r['house'], 'count': r['count'], 'members': '; '.join(names)})
         return _csv_response(rows, f'members_by_house_{ts}.csv')
 
+    if kind == 'members_by_role':
+        df = members.copy()
+        df['role'] = df.get('role', 'Member').replace('', 'Member').fillna('Member')
+        g = df.groupby('role').size().reset_index(name='count')
+        g = g.sort_values('count', ascending=False)
+        rows = []
+        for _, r in g.iterrows():
+            names = df[df['role'] == r['role']]['full_name'].tolist()
+            rows.append({'role': r['role'], 'count': r['count'], 'members': '; '.join(names)})
+        return _csv_response(rows, f'members_by_role_{ts}.csv')
+
     if kind == 'members_by_year':
         df = members.copy()
         if df.empty:
@@ -1895,7 +2084,7 @@ def report(kind):
         return _csv_response(_records(inactive), f'inactive_members_{ts}.csv')
 
     if kind == 'contact_directory':
-        cols = ['title','first_name','middle_name','last_name','email','phone','house']
+        cols = ['title','first_name','middle_name','last_name','email','phone','house','role']
         cols = [c for c in cols if c in members.columns]
         return _csv_response(_records(members[cols]) if not members.empty else [],
                              f'contact_directory_{ts}.csv')
@@ -1985,7 +2174,6 @@ def report(kind):
 @_admin_required
 def report_pdf(kind):
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-
     members        = _load(T_MEMBERS, MEMBERS_FILE)
     polls          = _load(T_POLLS, POLLS_FILE)
     votes          = _load(T_VOTES, VOTES_FILE)
@@ -2010,7 +2198,7 @@ def report_pdf(kind):
         if 'password_hash' in df.columns:
             df = df.drop(columns=['password_hash'])
         rows = df.to_dict('records') if not df.empty else []
-        cols = ['title','first_name','middle_name','last_name','email','phone','house']
+        cols = ['title','first_name','last_name','email','phone','house','role']
         cols = [c for c in cols if c in (rows[0].keys() if rows else [])]
         sections.append(('Members', rows, cols))
 
@@ -2053,8 +2241,7 @@ def report_pdf(kind):
         poll_id = request.args.get('poll_id', '')
         p = polls[polls['poll_id'] == poll_id] if not polls.empty else pd.DataFrame()
         if p.empty:
-            flash('Poll not found.', 'danger')
-            return redirect(url_for('admin.polls'))
+            flash('Poll not found.', 'danger'); return redirect(url_for('admin.polls'))
         p = p.iloc[0]
         title = f'Poll: {p["title"]}'
         try:
@@ -2129,6 +2316,8 @@ def backup():
         (T_CAMPAIGNS, CAMPAIGNS_FILE),
         (T_DUES, DUES_FILE),
         (T_DUES_CAMPAIGNS, DUES_CAMPAIGNS_FILE),
+        (T_ROLES, ROLES_FILE),
+        (T_ADMIN_USERS, ADMIN_USERS_FILE),
     ]
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         for table, path in tables:
