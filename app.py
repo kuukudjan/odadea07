@@ -1,14 +1,12 @@
 """
-app.py — ODADEAƐ07 Main Application (Secured, Supabase, 2FA, profile editing)
+app.py — ODADEAƐ07 Main Application (secured, Supabase, 2FA, profile editing)
 
-New in this version:
-  • Members can edit their own profile
-  • Members can change their own password
-  • Members can opt into 2FA (TOTP)
-  • Login history per member
-  • Poll scheduling (open_at / close_at) and anonymity
-  • Persistent rate limiting (survives redeploys)
-  • Session-expiry countdown in the header
+Changes in this version:
+  • Password complexity (letter + digit)
+  • Lockout by email + IP
+  • Optional email verification
+  • Suspended/inactive members hidden from directory & counts
+  • Welcome email on registration
 """
 
 import os
@@ -19,7 +17,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import (Flask, render_template_string, request, session, redirect,
-                   url_for, flash, jsonify, g)
+                   url_for, flash, jsonify)
 from flask_wtf.csrf import CSRFProtect, CSRFError
 import pandas as pd
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -28,7 +26,7 @@ import supabase_client as sb
 import password_reset as pr
 import mailer
 import two_factor as tf
-from chart_helpers import bar_chart, line_chart, CHART_JS_CDN
+from chart_helpers import line_chart, CHART_JS_CDN
 
 # ═══════════════════════════════════════════════════════════
 # CONFIG
@@ -61,21 +59,23 @@ app.config.update(
 
 csrf = CSRFProtect(app)
 
-
 # ═══════════════════════════════════════════════════════════
 # ADMIN PANEL MOUNT
 # ═══════════════════════════════════════════════════════════
 from admin_routes import admin_bp  # noqa: E402
 app.register_blueprint(admin_bp)
 
-
 # ═══════════════════════════════════════════════════════════
-# PERSISTENT RATE LIMITING
+# RATE LIMITING + SECURITY
 # ═══════════════════════════════════════════════════════════
 _WINDOW = timedelta(minutes=15)
 _MAX    = 5
 _RESET_WINDOW = timedelta(hours=1)
 _RESET_MAX    = 3
+
+REQUIRE_EMAIL_VERIFICATION = os.environ.get(
+    'REQUIRE_EMAIL_VERIFICATION', 'false'
+).lower() == 'true'
 
 
 def _client_ip():
@@ -85,8 +85,15 @@ def _client_ip():
     return request.remote_addr or 'unknown'
 
 
-def _rate_check(prefix, ip, window, max_attempts):
-    key = f'{prefix}:{ip}'
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _rate_check(prefix, identifier, window, max_attempts):
+    key = f'{prefix}:{identifier}'
     attempts = sb.rate_limit_get(key)
     now = datetime.now()
     cutoff = now - window
@@ -96,25 +103,24 @@ def _rate_check(prefix, ip, window, max_attempts):
 
 
 def _rate_record(key, attempts):
-    attempts = attempts + [datetime.now().isoformat()]
-    sb.rate_limit_set(key, attempts)
+    sb.rate_limit_set(key, attempts + [datetime.now().isoformat()])
 
 
-def _rate_clear(prefix, ip):
-    key = f'{prefix}:{ip}'
-    sb.rate_limit_set(key, [])
+def _rate_clear(prefix, identifier):
+    sb.rate_limit_set(f'{prefix}:{identifier}', [])
 
 
-def _parse_iso(s):
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
+def _password_ok(password):
+    """Require 8+ chars, at least one letter and one digit."""
+    if len(password) < 8:
+        return False, 'Password must be at least 8 characters.'
+    has_letter = any(c.isalpha() for c in password)
+    has_digit  = any(c.isdigit() for c in password)
+    if not (has_letter and has_digit):
+        return False, 'Password must contain at least one letter and one number.'
+    return True, ''
 
 
-# ═══════════════════════════════════════════════════════════
-# ERROR HANDLERS
-# ═══════════════════════════════════════════════════════════
 @app.errorhandler(CSRFError)
 def handle_csrf_error(e):
     flash('Security check failed. Please try again.', 'danger')
@@ -144,6 +150,16 @@ def load_table(table_name, csv_path):
             return pd.DataFrame(rows).fillna('').astype(str)
         return pd.DataFrame()
     return load_csv(csv_path)
+
+
+def load_active_members(table_name, csv_path):
+    """Load members, filtering out suspended and inactive."""
+    df = load_table(table_name, csv_path)
+    if df.empty:
+        return df
+    if 'status' in df.columns:
+        df = df[df['status'].str.lower().isin(['', 'active'])]
+    return df
 
 
 def insert_row(table_name, csv_path, row):
@@ -218,7 +234,6 @@ def format_dob(day, month, year):
 
 
 def poll_is_open(p):
-    """Check whether a poll is open right now, based on schedule."""
     now = datetime.now()
     active = str(p.get('active', 'True')).lower() in ['true', '1', 'yes']
     if not active:
@@ -247,7 +262,7 @@ MONTHS = ['January','February','March','April','May','June',
 
 
 # ═══════════════════════════════════════════════════════════
-# PUBLIC LAYOUT (with session countdown)
+# PUBLIC LAYOUT
 # ═══════════════════════════════════════════════════════════
 PUBLIC_LAYOUT = r"""<!DOCTYPE html>
 <html lang="en">
@@ -298,8 +313,7 @@ PUBLIC_LAYOUT = r"""<!DOCTYPE html>
         padding:0.5rem 1rem;text-align:center;font-size:0.85rem;font-weight:600;
         border-bottom:1px solid #ffe0a3;">
       Your session ends in <span id="session-countdown">--:--</span>.
-      <a href="{{ url_for('login') }}" style="color:#7a5800;text-decoration:underline;">Log in again</a>
-      to keep it active.
+      <a href="{{ url_for('login') }}" style="color:#7a5800;text-decoration:underline;">Log in again</a>.
     </div>
     {% endif %}
 </header>
@@ -325,13 +339,11 @@ PUBLIC_LAYOUT = r"""<!DOCTYPE html>
 </footer>
 
 <script>
-// Register a service worker for basic offline caching
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', function() {
     navigator.serviceWorker.register('/static/sw.js').catch(function(){});
   });
 }
-// Session countdown
 (function() {
   var banner = document.getElementById('session-banner');
   if (!banner) return;
@@ -368,7 +380,7 @@ def page(content, **ctx):
 # ═══════════════════════════════════════════════════════════
 @app.route('/')
 def index():
-    members = load_table(T_MEMBERS, MEMBERS_FILE)
+    members = load_active_members(T_MEMBERS, MEMBERS_FILE)
     polls   = load_table(T_POLLS, POLLS_FILE)
     camps   = load_table(T_CAMPAIGNS, CAMPAIGNS_FILE)
 
@@ -407,19 +419,19 @@ def index():
 
 
 # ═══════════════════════════════════════════════════════════
-# REGISTER
+# REGISTER (with password complexity + welcome email)
 # ═══════════════════════════════════════════════════════════
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        first_name        = sanitize(request.form.get('first_name', ''), 120)
-        middle_name       = sanitize(request.form.get('middle_name', ''), 120)
-        last_name         = sanitize(request.form.get('last_name', ''), 120)
-        email             = sanitize(request.form.get('email', ''), 120).lower()
-        phone             = sanitize(request.form.get('phone', ''), 40)
-        house             = sanitize(request.form.get('house', ''), 60)
-        password          = request.form.get('password', '')
-        confirm           = request.form.get('confirm', '')
+        first_name  = sanitize(request.form.get('first_name', ''), 120)
+        middle_name = sanitize(request.form.get('middle_name', ''), 120)
+        last_name   = sanitize(request.form.get('last_name', ''), 120)
+        email       = sanitize(request.form.get('email', ''), 120).lower()
+        phone       = sanitize(request.form.get('phone', ''), 40)
+        house       = sanitize(request.form.get('house', ''), 60)
+        password    = request.form.get('password', '')
+        confirm     = request.form.get('confirm', '')
 
         if not (first_name and last_name and email and password):
             flash('First name, last name, email and password are required.', 'danger')
@@ -427,8 +439,10 @@ def register():
         if '@' not in email or '.' not in email:
             flash('Please enter a valid email address.', 'danger')
             return redirect(url_for('register'))
-        if len(password) < 8:
-            flash('Password must be at least 8 characters.', 'danger')
+
+        ok, msg = _password_ok(password)
+        if not ok:
+            flash(msg, 'danger')
             return redirect(url_for('register'))
         if password != confirm:
             flash('Passwords do not match.', 'danger')
@@ -465,6 +479,13 @@ def register():
             'totp_secret':       '',
             'totp_enabled':      'False',
         })
+
+        # Send welcome email (fails silently if not configured)
+        try:
+            mailer.send_welcome(email, first_name)
+        except Exception:
+            pass
+
         flash(f'Welcome, {full_name}! Please log in.', 'success')
         return redirect(url_for('login'))
 
@@ -491,7 +512,7 @@ def register():
             <input name="house" maxlength="60"></div>
         </div>
         <div class="form-row">
-          <div class="form-group"><label>Password * (min 8)</label>
+          <div class="form-group"><label>Password * (8+ chars, letter+digit)</label>
             <input type="password" name="password" required minlength="8"></div>
           <div class="form-group"><label>Confirm *</label>
             <input type="password" name="confirm" required minlength="8"></div>
@@ -506,19 +527,23 @@ def register():
 
 
 # ═══════════════════════════════════════════════════════════
-# LOGIN (with 2FA + history + persistent rate limit)
+# LOGIN (with email + IP lockout)
 # ═══════════════════════════════════════════════════════════
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     ip = _client_ip()
     if request.method == 'POST':
-        locked, attempts, key = _rate_check('login', ip, _WINDOW, _MAX)
-        if locked:
-            flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
-            return redirect(url_for('login'))
-
         email = sanitize(request.form.get('email', ''), 120).lower()
         pwd   = request.form.get('password', '')
+
+        # Check IP-based lockout
+        ip_locked, ip_attempts, ip_key = _rate_check('login-ip', ip, _WINDOW, _MAX)
+        # Check email-based lockout
+        email_locked, email_attempts, email_key = _rate_check('login-email', email, _WINDOW, _MAX)
+
+        if ip_locked or email_locked:
+            flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
+            return redirect(url_for('login'))
 
         members = load_table(T_MEMBERS, MEMBERS_FILE)
         row = None
@@ -536,12 +561,12 @@ def login():
                     ok = False
 
         if ok and row:
-            # Check 2FA
             if str(row.get('totp_enabled', 'False')).lower() == 'true':
                 session['pending_2fa_member_id'] = row['member_id']
                 return redirect(url_for('login_2fa'))
 
-            _rate_clear('login', ip)
+            _rate_clear('login-ip', ip)
+            _rate_clear('login-email', email)
             session['member_id'] = row['member_id']
             session.permanent = True
             sb.log_login('member', row['member_id'], ip,
@@ -549,10 +574,11 @@ def login():
             flash(f"Welcome back, {row.get('first_name') or row.get('full_name')}!", 'success')
             return redirect(url_for('dashboard'))
 
-        _rate_record(key, attempts)
-        sb.log_login('member', None, ip,
-                     request.headers.get('User-Agent', ''), False)
-        remaining = _MAX - (len(attempts) + 1)
+        # Record failure on both keys
+        _rate_record(ip_key, ip_attempts)
+        _rate_record(email_key, email_attempts)
+        sb.log_login('member', None, ip, request.headers.get('User-Agent', ''), False)
+        remaining = _MAX - (len(ip_attempts) + 1)
         if remaining > 0:
             flash(f'Invalid email or password. {remaining} attempts left.', 'danger')
         else:
@@ -688,8 +714,12 @@ def reset_password():
     if request.method == 'POST':
         pwd = request.form.get('password', '')
         cnf = request.form.get('confirm', '')
-        if len(pwd) < 8 or pwd != cnf:
-            flash('Passwords must match and be at least 8 characters.', 'danger')
+        ok_pwd, msg = _password_ok(pwd)
+        if not ok_pwd:
+            flash(msg, 'danger')
+            return redirect(url_for('reset_password', token=token))
+        if pwd != cnf:
+            flash('Passwords do not match.', 'danger')
             return redirect(url_for('reset_password', token=token))
         ok, msg = pr.consume_token(token, pwd)
         flash(msg, 'success' if ok else 'danger')
@@ -700,7 +730,7 @@ def reset_password():
       <form method="POST">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="token" value="{{ token }}">
-        <div class="form-group"><label>New password</label>
+        <div class="form-group"><label>New password (8+ chars, letter+digit)</label>
           <input type="password" name="password" required minlength="8" autofocus></div>
         <div class="form-group"><label>Confirm password</label>
           <input type="password" name="confirm" required minlength="8"></div>
@@ -711,7 +741,7 @@ def reset_password():
 
 
 # ═══════════════════════════════════════════════════════════
-# MEMBER PROFILE EDIT + PASSWORD CHANGE + 2FA + LOGIN HISTORY
+# MEMBER PROFILE + PASSWORD + 2FA + LOGIN HISTORY
 # ═══════════════════════════════════════════════════════════
 @app.route('/profile', methods=['GET', 'POST'])
 @member_required
@@ -741,7 +771,6 @@ def profile_page():
         if sb.SUPABASE_ENABLED:
             sb.update_where(T_MEMBERS, 'member_id', m['member_id'], updates)
         else:
-            # CSV fallback
             df = load_csv(MEMBERS_FILE)
             if not df.empty:
                 mask = df['member_id'] == m['member_id']
@@ -829,8 +858,9 @@ def change_password_page():
         if not check_password_hash(m.get('password_hash', ''), old):
             flash('Current password is incorrect.', 'danger')
             return redirect(url_for('change_password_page'))
-        if len(new) < 8:
-            flash('New password must be at least 8 characters.', 'danger')
+        ok_pwd, msg = _password_ok(new)
+        if not ok_pwd:
+            flash(msg, 'danger')
             return redirect(url_for('change_password_page'))
         if new != cnf:
             flash('Passwords do not match.', 'danger')
@@ -846,7 +876,7 @@ def change_password_page():
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-group"><label>Current password</label>
           <input type="password" name="old_password" required></div>
-        <div class="form-group"><label>New password</label>
+        <div class="form-group"><label>New password (8+ chars, letter+digit)</label>
           <input type="password" name="new_password" required minlength="8"></div>
         <div class="form-group"><label>Confirm new password</label>
           <input type="password" name="confirm" required minlength="8"></div>
@@ -897,7 +927,7 @@ def two_factor_setup():
     content = render_template_string("""
     <div class="form-container">
       <h1>Set up 2FA</h1>
-      <p class="form-subtitle">Scan this URL in Google Authenticator or Authy</p>
+      <p class="form-subtitle">Add this secret to Google Authenticator or Authy</p>
       <div class="form-group">
         <label>Secret (add manually if you can't scan)</label>
         <input value="{{ secret }}" readonly>
@@ -952,7 +982,7 @@ def login_history_page():
 
 
 # ═══════════════════════════════════════════════════════════
-# DASHBOARD (with charts)
+# DASHBOARD
 # ═══════════════════════════════════════════════════════════
 @app.route('/dashboard')
 @member_required
@@ -965,13 +995,12 @@ def dashboard():
     votes    = load_table(T_VOTES, VOTES_FILE)
     dues     = load_table(T_DUES, DUES_FILE)
     contribs = load_table(T_CONTRIBUTIONS, CONTRIBUTIONS_FILE)
-    members  = load_table(T_MEMBERS, MEMBERS_FILE)
+    members  = load_active_members(T_MEMBERS, MEMBERS_FILE)
 
     my_votes   = len(votes[votes['member_id'] == m['member_id']]) if not votes.empty else 0
     my_dues    = safe_amount(pd.to_numeric(dues[dues['member_id'] == m['member_id']]['amount'], errors='coerce').fillna(0).sum()) if not dues.empty else 0
     my_contrib = safe_amount(pd.to_numeric(contribs[contribs['member_id'] == m['member_id']]['amount'], errors='coerce').fillna(0).sum()) if not contribs.empty else 0
 
-    # Monthly dues chart
     labels, values = [], []
     if not dues.empty:
         df = dues.copy()
@@ -1052,24 +1081,21 @@ def dashboard():
 
 
 # ═══════════════════════════════════════════════════════════
-# MEMBERS DIRECTORY (with search)
+# MEMBERS DIRECTORY (active members only)
 # ═══════════════════════════════════════════════════════════
 @app.route('/members')
 @member_required
 def members_directory():
     q = sanitize(request.args.get('q', ''), 100).lower()
-    df = load_table(T_MEMBERS, MEMBERS_FILE)
+    df = load_active_members(T_MEMBERS, MEMBERS_FILE)
     if not df.empty and 'password_hash' in df.columns:
         df = df.drop(columns=['password_hash'])
     members = df.to_dict('records') if not df.empty else []
     if q:
         members = [m for m in members if q in (
-            (m.get('full_name','') + ' ' +
-             m.get('first_name','') + ' ' +
-             m.get('middle_name','') + ' ' +
-             m.get('last_name','') + ' ' +
-             m.get('email','') + ' ' +
-             m.get('house','') + ' ' +
+            (m.get('full_name','') + ' ' + m.get('first_name','') + ' ' +
+             m.get('middle_name','') + ' ' + m.get('last_name','') + ' ' +
+             m.get('email','') + ' ' + m.get('house','') + ' ' +
              m.get('job_title','')).lower()
         )]
 
@@ -1113,7 +1139,7 @@ def members_directory():
 
 
 # ═══════════════════════════════════════════════════════════
-# POLLS (respecting schedule + anonymity)
+# POLLS
 # ═══════════════════════════════════════════════════════════
 @app.route('/polls', methods=['GET', 'POST'])
 @member_required
@@ -1368,6 +1394,45 @@ def health():
         'two_factor_available': True,
         'time': datetime.now().isoformat()
     })
+
+
+@app.route('/debug-supabase')
+def debug_supabase():
+    result = {
+        'supabase_enabled': sb.SUPABASE_ENABLED,
+        'supabase_url_set': bool(os.environ.get('SUPABASE_URL')),
+        'supabase_key_set': bool(os.environ.get('SUPABASE_KEY')),
+        'client_initialized': False,
+        'client_error': None,
+        'tables': {}
+    }
+    try:
+        client = sb.get_client()
+    except Exception as e:
+        result['client_error'] = str(e)
+        client = None
+    result['client_initialized'] = client is not None
+    if client is None:
+        return jsonify(result)
+    for table in ['members', 'polls', 'votes', 'dues',
+                  'dues_campaigns', 'contributions',
+                  'contributions_campaigns', 'password_resets',
+                  'admin_users', 'roles', 'login_history', 'rate_limit']:
+        try:
+            resp = client.table(table).select('*').limit(1).execute()
+            rows = resp.data or []
+            result['tables'][table] = {
+                'ok': True,
+                'sample_row_count': len(rows),
+                'sample_keys': list(rows[0].keys()) if rows else []
+            }
+        except Exception as e:
+            result['tables'][table] = {
+                'ok': False,
+                'error': str(e),
+                'error_type': type(e).__name__
+            }
+    return jsonify(result)
 
 
 if __name__ == '__main__':
