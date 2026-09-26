@@ -3,6 +3,8 @@ admin_routes.py — ODADEAƐ07 Admin Panel (Supabase-aware, 25+ reports)
 
 Member fields: title, first_name, middle_name, last_name,
 dob_day, dob_month, dob_year, emergency_contact, job_title, industry.
+
+Poll options: unlimited — admin can add or remove option fields dynamically.
 """
 
 import os
@@ -223,6 +225,97 @@ ADMIN_LAYOUT = r"""<!DOCTYPE html>
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Admin — ODADEAƐ07</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+
+    <!-- ── Admin-only inline styles ──────────────────────── -->
+    <style>
+      .option-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.6rem;
+      }
+      .option-row .option-number {
+        width: 28px;
+        height: 28px;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #e7ecff;
+        color: #1a3fbf;
+        border-radius: 50%;
+        font-size: 0.82rem;
+        font-weight: 800;
+      }
+      .option-row input[type="text"] {
+        flex: 1;
+        padding: 0.75rem 1rem;
+        border: 2px solid #e3e7ee;
+        border-radius: 10px;
+        font-size: 0.95rem;
+        background: #f6f8ff;
+        transition: all 0.2s;
+      }
+      .option-row input[type="text"]:focus {
+        outline: none;
+        border-color: #1a3fbf;
+        background: #ffffff;
+        box-shadow: 0 0 0 4px rgba(26, 63, 191, 0.15);
+      }
+      .option-remove {
+        flex-shrink: 0;
+        width: 36px;
+        height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 8px;
+        border: none;
+        background: #ffe7e8;
+        color: #ed1c24;
+        cursor: pointer;
+        font-size: 1.1rem;
+        font-weight: 800;
+        transition: all 0.2s;
+      }
+      .option-remove:hover {
+        background: #ed1c24;
+        color: #ffffff;
+      }
+      .option-remove:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+      .poll-options-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+        padding-top: 0.75rem;
+        border-top: 1px dashed #e3e7ee;
+      }
+      .poll-options-toolbar .option-count {
+        font-size: 0.82rem;
+        color: #6c757d;
+        font-weight: 600;
+      }
+      #add-option-btn {
+        padding: 0.55rem 1.1rem;
+        border-radius: 10px;
+        border: 2px solid #1a3fbf;
+        background: #ffffff;
+        color: #1a3fbf;
+        font-weight: 700;
+        cursor: pointer;
+        font-size: 0.88rem;
+        transition: all 0.2s;
+      }
+      #add-option-btn:hover {
+        background: #1a3fbf;
+        color: #ffffff;
+      }
+    </style>
 </head>
 <body>
 <header class="main-header">
@@ -405,7 +498,7 @@ def home():
 
 
 # ─────────────────────────────────────────────────────────
-# POLLS
+# POLLS — dynamic options (unlimited)
 # ─────────────────────────────────────────────────────────
 @admin_bp.route('/polls', methods=['GET', 'POST'])
 @_admin_required
@@ -416,12 +509,21 @@ def polls():
         if action == 'create':
             title = _sanitize(request.form.get('title', ''), 200)
             desc  = _sanitize(request.form.get('description', ''), 400)
+
+            # Read all options. The form sends option_0, option_1, ...
+            # up to (option_count - 1). We cap at 100 to prevent abuse.
             try:
                 n = int(request.form.get('option_count', 2))
             except ValueError:
                 n = 2
-            opts = [_sanitize(request.form.get(f'option_{i}', ''), 120) for i in range(n)]
-            opts = [o for o in opts if o]
+            n = max(2, min(n, 100))
+
+            opts = []
+            for i in range(n):
+                v = _sanitize(request.form.get(f'option_{i}', ''), 120)
+                if v:
+                    opts.append(v)
+
             if title and len(opts) >= 2:
                 _insert(T_POLLS, POLLS_FILE, {
                     'poll_id': f"POLL{int(time.time())}_{random.randint(100,999)}",
@@ -431,9 +533,9 @@ def polls():
                     'created_at': datetime.now().isoformat(),
                     'active': 'True',
                 })
-                flash(f'✅ Poll created: "{title}"', 'success')
+                flash(f'✅ Poll created: "{title}" with {len(opts)} options.', 'success')
             else:
-                flash('Need a title and at least 2 options.', 'danger')
+                flash('Need a title and at least 2 non-empty options.', 'danger')
 
         elif action == 'delete':
             pid = request.form.get('poll_id')
@@ -485,6 +587,7 @@ def polls():
                 'active': str(p.get('active', True)).lower() in ['true', '1', 'yes'],
                 'created_at': str(p.get('created_at', ''))[:10],
                 'total': total,
+                'option_count': len(opts),
                 'turnout': round(total / member_count * 100, 1) if member_count else 0,
                 'results': results, 'winner': winner,
                 'voters': pv[['member_name', 'voted_at']].to_dict('records') if not pv.empty else [],
@@ -502,23 +605,51 @@ def polls():
 
     <div class="form-container">
       <h1>➕ Create a Poll</h1>
-      <form method="POST">
+      <p class="form-subtitle">Add as many options as you need</p>
+      <form method="POST" id="create-poll-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="create">
-        <div class="form-group"><label>Title *</label>
-          <input name="title" required maxlength="200"></div>
+        <input type="hidden" name="option_count" id="option_count" value="2">
+
+        <div class="form-group"><label>Poll Title *</label>
+          <input name="title" required maxlength="200"
+                 placeholder="e.g. Where should we hold the 2026 reunion?"></div>
+
         <div class="form-group"><label>Description (optional)</label>
-          <textarea name="description" maxlength="400"></textarea></div>
-        <div class="form-group"><label>Option 1 *</label>
-          <input name="option_0" required maxlength="120"></div>
-        <div class="form-group"><label>Option 2 *</label>
-          <input name="option_1" required maxlength="120"></div>
-        <div class="form-group"><label>Option 3 (optional)</label>
-          <input name="option_2" maxlength="120"></div>
-        <div class="form-group"><label>Option 4 (optional)</label>
-          <input name="option_3" maxlength="120"></div>
-        <input type="hidden" name="option_count" value="4">
-        <button class="btn btn-primary btn-full">Create Poll</button>
+          <textarea name="description" maxlength="400"
+                    placeholder="Add context for voters"></textarea></div>
+
+        <div class="form-group">
+          <label>Options * <span style="font-weight:400;color:#6c757d;text-transform:none;letter-spacing:0;">(minimum 2)</span></label>
+          <div id="options-list">
+
+            <div class="option-row" data-index="0">
+              <span class="option-number">1</span>
+              <input type="text" name="option_0" required maxlength="120"
+                     placeholder="Option 1">
+              <button type="button" class="option-remove" disabled
+                      title="Minimum 2 options required" aria-label="Remove option">✕</button>
+            </div>
+
+            <div class="option-row" data-index="1">
+              <span class="option-number">2</span>
+              <input type="text" name="option_1" required maxlength="120"
+                     placeholder="Option 2">
+              <button type="button" class="option-remove" disabled
+                      title="Minimum 2 options required" aria-label="Remove option">✕</button>
+            </div>
+
+          </div>
+
+          <div class="poll-options-toolbar">
+            <button type="button" id="add-option-btn">➕ Add another option</button>
+            <span class="option-count"><span id="option-counter">2</span> options</span>
+          </div>
+        </div>
+
+        <button class="btn btn-primary btn-full" style="margin-top:1.5rem;">
+          ✅ Create Poll
+        </button>
       </form>
     </div>
 
@@ -530,7 +661,10 @@ def polls():
             <span class="status-badge status-{{ 'active' if p.active else 'closed' }}">
               {{ 'Active' if p.active else 'Closed' }}</span></h2>
           <p>{{ p.description }}</p>
-          <p class="poll-meta">Created {{ p.created_at }} • ID <code>{{ p.id }}</code></p>
+          <p class="poll-meta">
+            Created {{ p.created_at }} • ID <code>{{ p.id }}</code> •
+            {{ p.option_count }} option{{ 's' if p.option_count != 1 else '' }}
+          </p>
         </div>
         <div class="poll-totals">
           <div class="poll-total-value">{{ p.total }}</div>
@@ -538,6 +672,7 @@ def polls():
           <div class="poll-turnout">{{ p.turnout }}% turnout</div>
         </div>
       </div>
+
       {% for o in p.results %}
       <div class="poll-result-row {% if o.text == p.winner %}winner{% endif %}">
         <div class="result-option-name">{{ o.text }}
@@ -589,6 +724,73 @@ def polls():
     {% else %}
     <p class="empty-state">No polls yet. Create one above.</p>
     {% endfor %}
+
+    <script>
+    (function () {
+      var list        = document.getElementById('options-list');
+      var addBtn      = document.getElementById('add-option-btn');
+      var countInput  = document.getElementById('option_count');
+      var counter     = document.getElementById('option-counter');
+      var MIN_OPTIONS = 2;
+      var MAX_OPTIONS = 100;
+
+      function refresh() {
+        var rows = list.querySelectorAll('.option-row');
+        // Renumber rows
+        rows.forEach(function (row, i) {
+          row.dataset.index = i;
+          row.querySelector('.option-number').textContent = (i + 1);
+          var inp = row.querySelector('input[type="text"]');
+          inp.name = 'option_' + i;
+          inp.placeholder = 'Option ' + (i + 1);
+          var rm = row.querySelector('.option-remove');
+          rm.disabled = (rows.length <= MIN_OPTIONS);
+        });
+        countInput.value = rows.length;
+        counter.textContent = rows.length;
+        addBtn.disabled = (rows.length >= MAX_OPTIONS);
+        if (addBtn.disabled) {
+          addBtn.textContent = 'Maximum reached';
+        } else {
+          addBtn.textContent = '➕ Add another option';
+        }
+      }
+
+      function addOption() {
+        var rows = list.querySelectorAll('.option-row');
+        if (rows.length >= MAX_OPTIONS) return;
+        var i = rows.length;
+        var row = document.createElement('div');
+        row.className = 'option-row';
+        row.dataset.index = i;
+        row.innerHTML =
+          '<span class="option-number">' + (i + 1) + '</span>' +
+          '<input type="text" name="option_' + i + '" maxlength="120" ' +
+          'placeholder="Option ' + (i + 1) + '">' +
+          '<button type="button" class="option-remove" ' +
+          'title="Remove this option" aria-label="Remove option">✕</button>';
+        list.appendChild(row);
+        refresh();
+        // Focus the new input
+        row.querySelector('input[type="text"]').focus();
+      }
+
+      list.addEventListener('click', function (e) {
+        if (!e.target.classList.contains('option-remove')) return;
+        var rows = list.querySelectorAll('.option-row');
+        if (rows.length <= MIN_OPTIONS) return;
+        var row = e.target.closest('.option-row');
+        if (!row) return;
+        row.remove();
+        refresh();
+      });
+
+      addBtn.addEventListener('click', addOption);
+
+      // Initial state
+      refresh();
+    })();
+    </script>
     """, reports=reports)
     return _page(body)
 
@@ -1276,7 +1478,6 @@ def reports():
         <div class="report-card"><h3>All Members</h3>
           <a href="{{ url_for('admin.report', kind='all_members') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>Full Member Profiles</h3>
-          <p>Every field including DOB, job, industry.</p>
           <a href="{{ url_for('admin.report', kind='members_full_profile') }}" class="btn btn-primary">⬇ Download</a></div>
         <div class="report-card"><h3>By House</h3>
           <a href="{{ url_for('admin.report', kind='members_by_house') }}" class="btn btn-primary">⬇ Download</a></div>
@@ -1366,6 +1567,7 @@ def report(kind):
                 'description': p.get('description', ''),
                 'active': p.get('active', ''),
                 'created_at': p.get('created_at', ''),
+                'option_count': len(opts),
                 'total_votes': len(pv),
                 'turnout_pct': round(len(pv) / member_count * 100, 1) if member_count else 0,
                 'winner': winner,
