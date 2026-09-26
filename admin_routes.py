@@ -1,8 +1,5 @@
 """
-admin_routes.py — ODADEAƐ07 Admin Panel (Supabase-aware, 25+ reports)
-
-Member fields: title, first_name, middle_name, last_name,
-dob_day, dob_month, dob_year, emergency_contact, job_title, industry.
+admin_routes.py — ODADEAƐ07 Admin Panel (Supabase-aware)
 
 Poll options: unlimited — admin can add or remove option fields dynamically.
 """
@@ -225,97 +222,6 @@ ADMIN_LAYOUT = r"""<!DOCTYPE html>
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Admin — ODADEAƐ07</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-
-    <!-- ── Admin-only inline styles ──────────────────────── -->
-    <style>
-      .option-row {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        margin-bottom: 0.6rem;
-      }
-      .option-row .option-number {
-        width: 28px;
-        height: 28px;
-        flex-shrink: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: #e7ecff;
-        color: #1a3fbf;
-        border-radius: 50%;
-        font-size: 0.82rem;
-        font-weight: 800;
-      }
-      .option-row input[type="text"] {
-        flex: 1;
-        padding: 0.75rem 1rem;
-        border: 2px solid #e3e7ee;
-        border-radius: 10px;
-        font-size: 0.95rem;
-        background: #f6f8ff;
-        transition: all 0.2s;
-      }
-      .option-row input[type="text"]:focus {
-        outline: none;
-        border-color: #1a3fbf;
-        background: #ffffff;
-        box-shadow: 0 0 0 4px rgba(26, 63, 191, 0.15);
-      }
-      .option-remove {
-        flex-shrink: 0;
-        width: 36px;
-        height: 36px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 8px;
-        border: none;
-        background: #ffe7e8;
-        color: #ed1c24;
-        cursor: pointer;
-        font-size: 1.1rem;
-        font-weight: 800;
-        transition: all 0.2s;
-      }
-      .option-remove:hover {
-        background: #ed1c24;
-        color: #ffffff;
-      }
-      .option-remove:disabled {
-        opacity: 0.35;
-        cursor: not-allowed;
-      }
-      .poll-options-toolbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 0.5rem;
-        margin-top: 0.5rem;
-        padding-top: 0.75rem;
-        border-top: 1px dashed #e3e7ee;
-      }
-      .poll-options-toolbar .option-count {
-        font-size: 0.82rem;
-        color: #6c757d;
-        font-weight: 600;
-      }
-      #add-option-btn {
-        padding: 0.55rem 1.1rem;
-        border-radius: 10px;
-        border: 2px solid #1a3fbf;
-        background: #ffffff;
-        color: #1a3fbf;
-        font-weight: 700;
-        cursor: pointer;
-        font-size: 0.88rem;
-        transition: all 0.2s;
-      }
-      #add-option-btn:hover {
-        background: #1a3fbf;
-        color: #ffffff;
-      }
-    </style>
 </head>
 <body>
 <header class="main-header">
@@ -510,11 +416,9 @@ def polls():
             title = _sanitize(request.form.get('title', ''), 200)
             desc  = _sanitize(request.form.get('description', ''), 400)
 
-            # Read all options. The form sends option_0, option_1, ...
-            # up to (option_count - 1). We cap at 100 to prevent abuse.
             try:
                 n = int(request.form.get('option_count', 2))
-            except ValueError:
+            except (TypeError, ValueError):
                 n = 2
             n = max(2, min(n, 100))
 
@@ -606,48 +510,57 @@ def polls():
     <div class="form-container">
       <h1>➕ Create a Poll</h1>
       <p class="form-subtitle">Add as many options as you need</p>
+
       <form method="POST" id="create-poll-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="create">
-        <input type="hidden" name="option_count" id="option_count" value="2">
+        <input type="hidden" name="option_count" id="option_count_hidden" value="2">
 
-        <div class="form-group"><label>Poll Title *</label>
+        <div class="form-group">
+          <label>Poll Title *</label>
           <input name="title" required maxlength="200"
-                 placeholder="e.g. Where should we hold the 2026 reunion?"></div>
+                 placeholder="e.g. Where should we hold the 2026 reunion?">
+        </div>
 
-        <div class="form-group"><label>Description (optional)</label>
+        <div class="form-group">
+          <label>Description (optional)</label>
           <textarea name="description" maxlength="400"
-                    placeholder="Add context for voters"></textarea></div>
+                    placeholder="Add context for voters"></textarea>
+        </div>
 
         <div class="form-group">
           <label>Options * <span style="font-weight:400;color:#6c757d;text-transform:none;letter-spacing:0;">(minimum 2)</span></label>
-          <div id="options-list">
 
-            <div class="option-row" data-index="0">
-              <span class="option-number">1</span>
+          <div id="options-wrapper">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;" class="option-row">
+              <span style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;background:#e7ecff;color:#1a3fbf;border-radius:50%;font-size:13px;font-weight:800;flex-shrink:0;" class="option-num">1</span>
               <input type="text" name="option_0" required maxlength="120"
-                     placeholder="Option 1">
-              <button type="button" class="option-remove" disabled
-                      title="Minimum 2 options required" aria-label="Remove option">✕</button>
+                     placeholder="Option 1" style="flex:1;padding:12px 16px;border:2px solid #e3e7ee;border-radius:10px;font-size:15px;background:#f6f8ff;box-sizing:border-box;">
+              <button type="button" class="option-remove-btn" disabled
+                      style="width:36px;height:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;font-size:16px;font-weight:800;opacity:0.35;flex-shrink:0;">✕</button>
             </div>
 
-            <div class="option-row" data-index="1">
-              <span class="option-number">2</span>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;" class="option-row">
+              <span style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;background:#e7ecff;color:#1a3fbf;border-radius:50%;font-size:13px;font-weight:800;flex-shrink:0;" class="option-num">2</span>
               <input type="text" name="option_1" required maxlength="120"
-                     placeholder="Option 2">
-              <button type="button" class="option-remove" disabled
-                      title="Minimum 2 options required" aria-label="Remove option">✕</button>
+                     placeholder="Option 2" style="flex:1;padding:12px 16px;border:2px solid #e3e7ee;border-radius:10px;font-size:15px;background:#f6f8ff;box-sizing:border-box;">
+              <button type="button" class="option-remove-btn" disabled
+                      style="width:36px;height:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:not-allowed;font-size:16px;font-weight:800;opacity:0.35;flex-shrink:0;">✕</button>
             </div>
-
           </div>
 
-          <div class="poll-options-toolbar">
-            <button type="button" id="add-option-btn">➕ Add another option</button>
-            <span class="option-count"><span id="option-counter">2</span> options</span>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:12px;border-top:1px dashed #e3e7ee;">
+            <button type="button" id="add-option-btn"
+                    style="padding:9px 18px;border-radius:10px;border:2px solid #1a3fbf;background:#ffffff;color:#1a3fbf;font-weight:700;cursor:pointer;font-size:14px;">
+              ➕ Add another option
+            </button>
+            <span style="font-size:13px;color:#6c757d;font-weight:600;">
+              <span id="option-counter">2</span> options
+            </span>
           </div>
         </div>
 
-        <button class="btn btn-primary btn-full" style="margin-top:1.5rem;">
+        <button type="submit" class="btn btn-primary btn-full" style="margin-top:1.5rem;">
           ✅ Create Poll
         </button>
       </form>
@@ -726,70 +639,99 @@ def polls():
     {% endfor %}
 
     <script>
-    (function () {
-      var list        = document.getElementById('options-list');
-      var addBtn      = document.getElementById('add-option-btn');
-      var countInput  = document.getElementById('option_count');
-      var counter     = document.getElementById('option-counter');
-      var MIN_OPTIONS = 2;
-      var MAX_OPTIONS = 100;
+      (function () {
+        var MIN_OPTIONS = 2;
+        var MAX_OPTIONS = 100;
+        var wrapper = document.getElementById('options-wrapper');
+        var addBtn = document.getElementById('add-option-btn');
+        var countHidden = document.getElementById('option_count_hidden');
+        var counter = document.getElementById('option-counter');
 
-      function refresh() {
-        var rows = list.querySelectorAll('.option-row');
-        // Renumber rows
-        rows.forEach(function (row, i) {
-          row.dataset.index = i;
-          row.querySelector('.option-number').textContent = (i + 1);
-          var inp = row.querySelector('input[type="text"]');
-          inp.name = 'option_' + i;
-          inp.placeholder = 'Option ' + (i + 1);
-          var rm = row.querySelector('.option-remove');
-          rm.disabled = (rows.length <= MIN_OPTIONS);
-        });
-        countInput.value = rows.length;
-        counter.textContent = rows.length;
-        addBtn.disabled = (rows.length >= MAX_OPTIONS);
-        if (addBtn.disabled) {
-          addBtn.textContent = 'Maximum reached';
-        } else {
-          addBtn.textContent = '➕ Add another option';
+        function refresh() {
+          var rows = wrapper.querySelectorAll('.option-row');
+          for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            var num = row.querySelector('.option-num');
+            var inp = row.querySelector('input[type="text"]');
+            var rm  = row.querySelector('.option-remove-btn');
+            if (num) num.textContent = (i + 1);
+            if (inp) {
+              inp.name = 'option_' + i;
+              inp.placeholder = 'Option ' + (i + 1);
+            }
+            if (rm) {
+              if (rows.length <= MIN_OPTIONS) {
+                rm.disabled = true;
+                rm.style.cursor = 'not-allowed';
+                rm.style.opacity = '0.35';
+              } else {
+                rm.disabled = false;
+                rm.style.cursor = 'pointer';
+                rm.style.opacity = '1';
+              }
+            }
+          }
+          countHidden.value = rows.length;
+          counter.textContent = rows.length;
+          addBtn.disabled = (rows.length >= MAX_OPTIONS);
+          if (addBtn.disabled) {
+            addBtn.textContent = 'Maximum reached';
+          } else {
+            addBtn.textContent = '➕ Add another option';
+          }
         }
-      }
 
-      function addOption() {
-        var rows = list.querySelectorAll('.option-row');
-        if (rows.length >= MAX_OPTIONS) return;
-        var i = rows.length;
-        var row = document.createElement('div');
-        row.className = 'option-row';
-        row.dataset.index = i;
-        row.innerHTML =
-          '<span class="option-number">' + (i + 1) + '</span>' +
-          '<input type="text" name="option_' + i + '" maxlength="120" ' +
-          'placeholder="Option ' + (i + 1) + '">' +
-          '<button type="button" class="option-remove" ' +
-          'title="Remove this option" aria-label="Remove option">✕</button>';
-        list.appendChild(row);
+        function addOption() {
+          var rows = wrapper.querySelectorAll('.option-row');
+          if (rows.length >= MAX_OPTIONS) return;
+          var i = rows.length;
+
+          var row = document.createElement('div');
+          row.className = 'option-row';
+          row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:8px;';
+
+          var num = document.createElement('span');
+          num.className = 'option-num';
+          num.textContent = (i + 1);
+          num.style.cssText = 'width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;background:#e7ecff;color:#1a3fbf;border-radius:50%;font-size:13px;font-weight:800;flex-shrink:0;';
+          row.appendChild(num);
+
+          var inp = document.createElement('input');
+          inp.type = 'text';
+          inp.name = 'option_' + i;
+          inp.maxLength = 120;
+          inp.placeholder = 'Option ' + (i + 1);
+          inp.style.cssText = 'flex:1;padding:12px 16px;border:2px solid #e3e7ee;border-radius:10px;font-size:15px;background:#f6f8ff;box-sizing:border-box;';
+          row.appendChild(inp);
+
+          var rm = document.createElement('button');
+          rm.type = 'button';
+          rm.className = 'option-remove-btn';
+          rm.textContent = '✕';
+          rm.title = 'Remove this option';
+          rm.style.cssText = 'width:36px;height:36px;border-radius:8px;border:none;background:#ffe7e8;color:#ed1c24;cursor:pointer;font-size:16px;font-weight:800;flex-shrink:0;';
+          row.appendChild(rm);
+
+          wrapper.appendChild(row);
+          refresh();
+          inp.focus();
+        }
+
+        wrapper.addEventListener('click', function (e) {
+          var t = e.target;
+          if (!t.classList || !t.classList.contains('option-remove-btn')) return;
+          var rows = wrapper.querySelectorAll('.option-row');
+          if (rows.length <= MIN_OPTIONS) return;
+          var row = t.parentNode;
+          if (!row) return;
+          row.parentNode.removeChild(row);
+          refresh();
+        });
+
+        addBtn.addEventListener('click', addOption);
+
         refresh();
-        // Focus the new input
-        row.querySelector('input[type="text"]').focus();
-      }
-
-      list.addEventListener('click', function (e) {
-        if (!e.target.classList.contains('option-remove')) return;
-        var rows = list.querySelectorAll('.option-row');
-        if (rows.length <= MIN_OPTIONS) return;
-        var row = e.target.closest('.option-row');
-        if (!row) return;
-        row.remove();
-        refresh();
-      });
-
-      addBtn.addEventListener('click', addOption);
-
-      // Initial state
-      refresh();
-    })();
+      })();
     </script>
     """, reports=reports)
     return _page(body)
