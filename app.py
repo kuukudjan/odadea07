@@ -13,6 +13,10 @@ Date of birth:
 
 Other profile fields:
   • title, emergency_contact, job_title, industry, phone, house
+
+Diagnostics:
+  • /health          — basic status
+  • /debug-supabase  — per-table Supabase connectivity check (remove in production later)
 """
 
 import os
@@ -400,7 +404,7 @@ def register():
             'first_name':        first_name,
             'middle_name':       middle_name,
             'last_name':         last_name,
-            'full_name':         full_name,   # kept for backward compatibility
+            'full_name':         full_name,
             'dob_day':           dob_day,
             'dob_month':         dob_month,
             'dob_year':          dob_year,
@@ -523,7 +527,6 @@ def login():
             _clear(_login_attempts, ip)
             session['member_id'] = row.iloc[0]['member_id']
             session.permanent = True
-            # Prefer first_name, fall back to full_name
             r = row.iloc[0]
             display = (r.get('first_name') or r.get('full_name') or 'Odadeɛ')
             flash(f"Welcome back, {display}!", 'success')
@@ -1130,6 +1133,59 @@ def health():
         'email_enabled': mailer.EMAIL_ENABLED,
         'time': datetime.now().isoformat()
     })
+
+
+# ═══════════════════════════════════════════════════════════
+# DEBUG — Supabase per-table check (temporary, remove later)
+# ═══════════════════════════════════════════════════════════
+@app.route('/debug-supabase')
+def debug_supabase():
+    """
+    Diagnostic endpoint. For each Supabase table, it tries a
+    single-row read and reports the exact error, if any.
+    Remove this route before going to production long-term.
+    """
+    result = {
+        'supabase_enabled': sb.SUPABASE_ENABLED,
+        'supabase_url_set': bool(os.environ.get('SUPABASE_URL')),
+        'supabase_key_set': bool(os.environ.get('SUPABASE_KEY')),
+        'supabase_url_first_chars': (os.environ.get('SUPABASE_URL') or '')[:30],
+        'supabase_key_first_chars': (os.environ.get('SUPABASE_KEY') or '')[:20],
+        'client_initialized': False,
+        'client_error': None,
+        'tables': {}
+    }
+
+    try:
+        client = sb.get_client()
+    except Exception as e:
+        result['client_error'] = str(e)
+        client = None
+
+    result['client_initialized'] = client is not None
+
+    if client is None:
+        return jsonify(result)
+
+    for table in ['members', 'polls', 'votes', 'dues',
+                  'dues_campaigns', 'contributions',
+                  'contributions_campaigns', 'password_resets']:
+        try:
+            resp = client.table(table).select('*').limit(1).execute()
+            rows = resp.data or []
+            result['tables'][table] = {
+                'ok': True,
+                'sample_row_count': len(rows),
+                'sample_keys': list(rows[0].keys()) if rows else []
+            }
+        except Exception as e:
+            result['tables'][table] = {
+                'ok': False,
+                'error': str(e),
+                'error_type': type(e).__name__
+            }
+
+    return jsonify(result)
 
 
 if __name__ == '__main__':
